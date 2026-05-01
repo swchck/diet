@@ -1,0 +1,78 @@
+version: "3"
+
+vars:
+  DIRECTUS_URL: http://localhost:8055
+  DIRECTUS_TOKEN: e2e-test-token
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  up:
+    desc: Start Directus + Postgres + Redis
+    cmd: docker compose up -d
+
+  down:
+    desc: Stop all containers
+    cmd: docker compose down
+
+  clean:
+    desc: Stop containers and remove volumes
+    cmd: docker compose down -v
+
+  logs:
+    desc: Tail Directus logs
+    cmd: docker compose logs -f directus
+
+  wait:
+    desc: Wait until Directus is healthy
+    deps: [up]
+    cmd: |
+      echo "Waiting for Directus..."
+      until curl -sf {{.DIRECTUS_URL}}/server/health > /dev/null 2>&1; do
+        sleep 1
+      done
+      echo "Directus is ready at {{.DIRECTUS_URL}}"
+
+  # ---------------------------------------------------------------------------
+  # Build
+  # ---------------------------------------------------------------------------
+  build:
+    desc: Build diet binary
+    cmd: go build -o bin/diet ./cmd/diet
+    sources:
+      - "cmd/diet/**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - bin/diet
+
+  # ---------------------------------------------------------------------------
+  # DIET (Directus Import Export Tool)
+  # ---------------------------------------------------------------------------
+  diet:export:
+    desc: "Export collections from Directus"
+    deps: [build, wait]
+    cmd: >
+      ./bin/diet export
+      --url={{.DIRECTUS_URL}}
+      --token={{.DIRECTUS_TOKEN}}
+      {{.CLI_ARGS}}
+
+  diet:import:
+    desc: "Import archive into Directus (usage: task diet:import -- --input=archive.tar.zst)"
+    deps: [build, wait]
+    cmd: >
+      ./bin/diet import
+      --target-url={{.DIRECTUS_URL}}
+      --target-token={{.DIRECTUS_TOKEN}}
+      {{.CLI_ARGS}}
+
+  # ---------------------------------------------------------------------------
+  # Dev workflow
+  # ---------------------------------------------------------------------------
+  dev:
+    desc: Start Directus and build tools
+    cmds:
+      - task: wait
+      - task: build
