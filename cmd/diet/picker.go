@@ -38,10 +38,14 @@ var (
 		Foreground(lipgloss.Color("240")).
 		Padding(0, 1)
 
-	okColor   = lipgloss.Color("42")
-	warnColor = lipgloss.Color("214")
-	dimColor  = lipgloss.Color("240")
-	boldWhite = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("255"))
+	okColor    = lipgloss.Color("42")
+	warnColor  = lipgloss.Color("214")
+	dimColor   = lipgloss.Color("240")
+	accentCol  = lipgloss.Color("39")  // cyan-ish, matches frame border
+	labelCol   = lipgloss.Color("248") // header field labels
+	valueCol   = lipgloss.Color("255") // header field values
+	dangerCol  = lipgloss.Color("203") // red — for clean/delete mode
+	boldWhite  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("255"))
 
 	okStyle = lipgloss.NewStyle().Foreground(okColor)
 
@@ -56,7 +60,58 @@ var (
 	inactiveTabStyle = lipgloss.NewStyle().
 				Foreground(dimColor).
 				Padding(0, 1)
+
+	// k9s-style key bar: bright key in a colored chip, description dimmed.
+	keyChipStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("16")).
+			Background(accentCol).
+			Padding(0, 1)
+
+	keyDescStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("250"))
+
+	// Header label/value pair style.
+	headerLabelStyle = lipgloss.NewStyle().Foreground(labelCol)
+	headerValueStyle = lipgloss.NewStyle().Foreground(valueCol).Bold(true)
 )
+
+// renderKeyHint draws one key chip + dim description.
+func renderKeyHint(key, desc string) string {
+	return keyChipStyle.Render("<"+key+">") + " " + keyDescStyle.Render(desc)
+}
+
+// renderKeyBar joins key hints with two-space separators, falls back to
+// a compact form when the rendered width exceeds maxW (drops descriptions
+// for the last few hints first).
+func renderKeyBar(maxW int, hints ...[2]string) string {
+	parts := make([]string, len(hints))
+	for i, h := range hints {
+		parts[i] = renderKeyHint(h[0], h[1])
+	}
+	full := strings.Join(parts, "   ")
+	if lipgloss.Width(full) <= maxW {
+		return full
+	}
+	// Compact: drop descriptions, keep chips only.
+	chips := make([]string, len(hints))
+	for i, h := range hints {
+		chips[i] = keyChipStyle.Render("<" + h[0] + ">")
+	}
+	return strings.Join(chips, " ")
+}
+
+// maskToken returns the last 4 chars of a token preceded by 4 dots, or
+// "—" if the token is empty.
+func maskToken(token string) string {
+	if token == "" {
+		return "—"
+	}
+	if len(token) <= 4 {
+		return strings.Repeat("●", len(token))
+	}
+	return "●●●● " + token[len(token)-4:]
+}
 
 // Tab definition
 
@@ -96,8 +151,9 @@ const (
 
 type (
 	schemaLoadedMsg struct {
-		rows []collectionRow
-		tabs []tabDef
+		rows            []collectionRow
+		tabs            []tabDef
+		directusVersion string
 	}
 	infoLoadedMsg struct {
 		collection string
@@ -132,6 +188,9 @@ type pickerModel struct {
 	profileName string
 	format      string
 	output      string
+
+	// Server info — populated by loadSchema, surfaced in the header.
+	directusVersion string
 
 	// Data
 	allRows   []collectionRow
@@ -225,6 +284,19 @@ func (m pickerModel) tick() tea.Cmd {
 
 func (m pickerModel) loadSchema() tea.Cmd {
 	return func() tea.Msg {
+		// Best-effort fetch of the Directus version — header degrades to "?"
+		// gracefully if the endpoint is denied or unreachable.
+		var serverInfo struct {
+			Data struct {
+				Version string `json:"version"`
+			} `json:"data"`
+		}
+		var directusVersion string
+		if body, err := m.client.get("/server/info"); err == nil {
+			_ = json.Unmarshal(body, &serverInfo)
+			directusVersion = serverInfo.Data.Version
+		}
+
 		collections, err := fetchCollections(m.client)
 		if err != nil {
 			return exportErrorMsg{err}
@@ -367,7 +439,7 @@ func (m pickerModel) loadSchema() tea.Cmd {
 			tabIdx++
 		}
 
-		return schemaLoadedMsg{rows: rows, tabs: tabs}
+		return schemaLoadedMsg{rows: rows, tabs: tabs, directusVersion: directusVersion}
 	}
 }
 
@@ -391,6 +463,7 @@ func (m pickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.allRows = msg.rows
 		m.tabs = msg.tabs
+		m.directusVersion = msg.directusVersion
 		m.buildTable()
 		m.tblReady = true
 
@@ -745,6 +818,12 @@ func (m *pickerModel) rebuildTable() {
 func (m pickerModel) buildRows() []table.Row {
 	visible := m.visibleRows()
 	rows := make([]table.Row, len(visible))
+
+	dim := lipgloss.NewStyle().Foreground(dimColor)
+	selectedMark := lipgloss.NewStyle().Foreground(okColor).Bold(true).Render("●")
+	emptyMark := lipgloss.NewStyle().Foreground(dimColor).Render("○")
+	folderArrow := lipgloss.NewStyle().Foreground(accentCol).Render
+
 	for i, r := range visible {
 		indent := strings.Repeat("  ", r.depth)
 		switch {
@@ -755,37 +834,66 @@ func (m pickerModel) buildRows() []table.Row {
 			}
 			countStr := ""
 			if r.itemCount > 0 {
-				countStr = fmt.Sprintf("%d", r.itemCount)
+				countStr = dim.Render(fmt.Sprintf("%d", r.itemCount))
 			}
 			rows[i] = table.Row{
-				fmt.Sprintf("%s%s %s", indent, arrow, r.name),
+				fmt.Sprintf("%s%s %s", indent, folderArrow(arrow), dim.Render(r.name)),
 				countStr,
 				"",
 			}
 		case r.isSystem:
-			check := "○"
+			check := emptyMark
 			if r.selected {
-				check = "●"
+				check = selectedMark
 			}
-			status := extractSystemItemStatus(r.systemData)
+			status := colorizeSystemStatus(extractSystemItemStatus(r.systemData))
 			rows[i] = table.Row{
 				fmt.Sprintf("%s%s %s", indent, check, r.name),
 				"",
 				status,
 			}
 		default:
-			check := "○"
+			check := emptyMark
 			if r.selected {
-				check = "●"
+				check = selectedMark
 			}
 			rows[i] = table.Row{
 				fmt.Sprintf("%s%s %s", indent, check, r.name),
-				fmt.Sprintf("%d", r.itemCount),
-				fmt.Sprintf("%d", r.fieldCount),
+				colorizeCount(r.itemCount),
+				colorizeCount(r.fieldCount),
 			}
 		}
 	}
 	return rows
+}
+
+// colorizeCount dims zero, leaves small counts plain, warns above 10k —
+// makes large or empty collections jump out at a glance.
+func colorizeCount(n int) string {
+	s := fmt.Sprintf("%d", n)
+	switch {
+	case n == 0:
+		return lipgloss.NewStyle().Foreground(dimColor).Render(s)
+	case n >= 10_000:
+		return lipgloss.NewStyle().Foreground(warnColor).Bold(true).Render(s)
+	default:
+		return s
+	}
+}
+
+// colorizeSystemStatus styles the textual status pulled from a Directus
+// system item ("active" / "inactive" / "draft" / "—").
+func colorizeSystemStatus(s string) string {
+	switch s {
+	case "active", "published":
+		return lipgloss.NewStyle().Foreground(okColor).Render(s)
+	case "inactive", "archived", "draft":
+		return lipgloss.NewStyle().Foreground(dimColor).Render(s)
+	case "—", "":
+		return lipgloss.NewStyle().Foreground(dimColor).Render("—")
+	default:
+		return s
+	}
 }
 
 func (m pickerModel) visibleRows() []collectionRow {
@@ -930,8 +1038,8 @@ func (m pickerModel) selectedSystemItems() map[string][]json.RawMessage {
 // View
 
 func (m pickerModel) View() string {
-	w := m.width - 2
-	h := m.height - 2
+	w := m.width
+	h := m.height
 	if w < 40 {
 		w = 40
 	}
@@ -939,48 +1047,95 @@ func (m pickerModel) View() string {
 		h = 6
 	}
 
-	var body string
 	switch {
 	case m.done && m.mode == modeClean:
-		body = m.viewCleanDone(h)
+		return m.viewCleanDone(h)
 	case m.done:
-		body = m.viewDone(h)
+		return m.viewDone(h)
 	case m.confirming:
-		body = m.viewConfirm(h)
+		return m.viewConfirm(h)
 	case m.exporting:
-		body = m.viewExporting(w, h)
+		return m.viewExporting(w, h)
 	case m.easter != nil:
-		body = m.easter.view(w, h)
+		return m.easter.view(w, h)
 	case m.showHelp:
-		body = m.viewHelp(h)
+		return m.viewHelp(h)
 	case m.showInfo:
-		body = m.viewInfo(w, h)
+		return m.viewInfo(w, h)
 	case m.loading:
-		body = m.viewLoading(h)
+		return m.viewLoading(h)
 	default:
-		body = m.viewTable(w, h)
+		return m.viewTable(w, h)
 	}
-
-	frame := frameBorder.Width(w)
-	return frame.Render(body)
 }
 
+// titleText builds the breadcrumb title: "Diet › Export › Collections (47)".
+// The active tab segment is dropped while the schema is still loading.
 func (m pickerModel) titleText() string {
 	op := "Export"
 	if m.mode == modeClean {
 		op = "Clean"
 	}
-	return fmt.Sprintf("Diet %s (Directus Import Export Tool)", op)
+	sep := lipgloss.NewStyle().Foreground(dimColor).Render(" › ")
+	parts := []string{"Diet", op}
+	if m.tblReady && m.activeTab >= 0 && m.activeTab < len(m.tabs) {
+		t := m.tabs[m.activeTab]
+		parts = append(parts, fmt.Sprintf("%s (%d)", t.label, t.count))
+	}
+	return strings.Join(parts, sep)
 }
 
-func (m pickerModel) headerInfo() string {
-	dim := lipgloss.NewStyle().Foreground(dimColor)
-	parts := []string{}
-	if m.profileName != "" {
-		parts = append(parts, lipgloss.NewStyle().Foreground(okColor).Bold(true).Render(m.profileName))
+// viewHeaderMeta renders a two-column k9s-style metadata block:
+//
+//	Profile  my-server          Diet     0.1.0
+//	URL      http://localhost   Directus 11.5.1
+//	Token    ●●●● 4f7d          Selected 12/47
+//
+// On narrow terminals it collapses to a single line.
+func (m pickerModel) viewHeaderMeta(w int) string {
+	prof := m.profileName
+	if prof == "" {
+		prof = "—"
 	}
-	parts = append(parts, m.url, dim.Render(configPathDisplay()))
-	return statusBar.Render(strings.Join(parts, "  ·  "))
+	dirVer := m.directusVersion
+	if dirVer == "" {
+		dirVer = "—"
+	}
+	sel, total := m.countSelected()
+
+	row := func(label, value string) string {
+		return headerLabelStyle.Render(fmt.Sprintf("%-9s", label)) + " " +
+			headerValueStyle.Render(value)
+	}
+
+	leftRows := []string{
+		row("Profile", prof),
+		row("URL", truncate(m.url, max(w/2-12, 20))),
+		row("Token", maskToken(m.client.token)),
+	}
+	rightRows := []string{
+		row("Diet", version),
+		row("Directus", dirVer),
+		row("Selected", fmt.Sprintf("%d/%d", sel, total)),
+	}
+
+	if m.mode == modeClean {
+		// Surface the destructive context up top.
+		rightRows = append(rightRows,
+			lipgloss.NewStyle().Foreground(dangerCol).Bold(true).Render("● clean mode"))
+	}
+
+	// Collapse to one-line on narrow widths: Profile · URL · Selected.
+	if w < 70 {
+		oneLine := row("Profile", prof) + "   " + row("Selected", fmt.Sprintf("%d/%d", sel, total))
+		return lipgloss.NewStyle().Padding(0, 1).Render(oneLine)
+	}
+
+	left := lipgloss.JoinVertical(lipgloss.Left, leftRows...)
+	right := lipgloss.JoinVertical(lipgloss.Left, rightRows...)
+	leftCol := lipgloss.NewStyle().Width(w / 2).Padding(0, 1).Render(left)
+	rightCol := lipgloss.NewStyle().Padding(0, 1).Render(right)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
 }
 
 func (m pickerModel) renderTabs(maxW int) string {
@@ -1049,17 +1204,20 @@ func (m pickerModel) viewHelp(h int) string {
 func (m pickerModel) viewLoading(h int) string {
 	spin := spinChars[m.spinFrame%len(spinChars)]
 	title := titleBar.Render("◆ " + m.titleText())
-	source := m.headerInfo()
-	loading := fmt.Sprintf(" %s Loading schema...",
-		lipgloss.NewStyle().Foreground(warnColor).Render(spin))
+	meta := m.viewHeaderMeta(m.width)
+	loading := lipgloss.NewStyle().Padding(0, 1).Render(
+		fmt.Sprintf("%s %s",
+			lipgloss.NewStyle().Foreground(warnColor).Render(spin),
+			lipgloss.NewStyle().Foreground(valueCol).Render("Loading schema...")))
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, source, "", loading)
+	content := lipgloss.JoinVertical(lipgloss.Left, title, meta, "", loading)
 	return padToHeight(content, h)
 }
 
 func (m pickerModel) viewTable(w, h int) string {
 	title := titleBar.Render("◆ " + m.titleText())
-	source := m.headerInfo()
+	meta := m.viewHeaderMeta(w)
+	metaLines := strings.Count(meta, "\n") + 1
 
 	tabs := m.renderTabs(w)
 
@@ -1069,38 +1227,16 @@ func (m pickerModel) viewTable(w, h int) string {
 		searchLine = lipgloss.NewStyle().Padding(0, 1).Render(m.search.View())
 		hasSearch = true
 	} else if m.filterText != "" {
-		searchLine = statusBar.Render(fmt.Sprintf("filter: %s  (/ to edit, esc to clear)",
-			lipgloss.NewStyle().Foreground(borderColor).Render(m.filterText)))
+		searchLine = statusBar.Render(fmt.Sprintf("filter: %s  %s",
+			lipgloss.NewStyle().Foreground(borderColor).Render(m.filterText),
+			lipgloss.NewStyle().Foreground(dimColor).Render("(/ to edit, esc to clear)")))
 		hasSearch = true
 	}
 
-	var helpText string
-	switch m.mode {
-	case modeClean:
-		helpText = "space:select  →/←:expand  a:all  /:search  tab:next  d:delete  ?:help  q:quit"
-	default:
-		helpText = "space:select  →/←:expand  a:all  i:info  /:search  tab:next  e:export  ?:help  q:quit"
-	}
-	sel, total := m.countSelected()
-	selText := fmt.Sprintf("%d/%d selected", sel, total)
+	keyBar := m.renderKeyBarForMode(w - 2)
 
-	barStyle := lipgloss.NewStyle().
-		Background(lipgloss.Color("57")).
-		Foreground(lipgloss.Color("255")).
-		Padding(0, 1)
-	selStyle := lipgloss.NewStyle().
-		Background(lipgloss.Color("57")).
-		Foreground(okColor).
-		Bold(true)
-
-	left := barStyle.Render(helpText)
-	right := barStyle.Render(selStyle.Render(selText))
-	gap := max(w-lipgloss.Width(left)-lipgloss.Width(right), 0)
-	fill := lipgloss.NewStyle().Background(lipgloss.Color("57")).Render(strings.Repeat(" ", gap))
-	help := left + fill + right
-
-	// chrome: title(1) + source(1) + blank(1) + tabs(1) + blank(1) + help(1) + table_header(1) = 7
-	chrome := 7
+	// chrome lines: title(1) + meta(N) + blank(1) + tabs(1) + blank(1) + key-bar(1) + table-header(1)
+	chrome := 5 + metaLines
 	if hasSearch {
 		chrome++
 	}
@@ -1108,13 +1244,37 @@ func (m pickerModel) viewTable(w, h int) string {
 	m.tbl.SetHeight(tblH)
 	tbl := lipgloss.NewStyle().Padding(0, 1).Render(m.tbl.View())
 
-	parts := []string{title, source, "", tabs, ""}
+	parts := []string{title, meta, "", tabs, ""}
 	if hasSearch {
 		parts = append(parts, searchLine)
 	}
-	parts = append(parts, tbl, help)
+	parts = append(parts, tbl, lipgloss.NewStyle().Padding(0, 1).Render(keyBar))
 
 	return padToHeight(lipgloss.JoinVertical(lipgloss.Left, parts...), h)
+}
+
+// renderKeyBarForMode picks the appropriate set of key hints for the
+// current picker mode and renders them as a single-line bar.
+func (m pickerModel) renderKeyBarForMode(maxW int) string {
+	common := [][2]string{
+		{"space", "select"},
+		{"a", "all"},
+		{"/", "search"},
+		{"tab", "next tab"},
+	}
+	var action [2]string
+	if m.mode == modeClean {
+		action = [2]string{"d", "delete"}
+	} else {
+		action = [2]string{"e", "export"}
+	}
+	hints := make([][2]string, 0, len(common)+4)
+	hints = append(hints, common...)
+	hints = append(hints, action,
+		[2]string{"i", "info"},
+		[2]string{"?", "help"},
+		[2]string{"q", "quit"})
+	return renderKeyBar(maxW, hints...)
 }
 
 func (m pickerModel) viewInfo(w, h int) string {

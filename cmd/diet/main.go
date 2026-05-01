@@ -23,7 +23,7 @@ func main() {
 	// Global flags.
 	root.PersistentFlags().String("url", "", "Source Directus URL")
 	root.PersistentFlags().String("token", "", "Source Directus static token")
-	root.PersistentFlags().Bool("simpleui", false, "Disable TUI, use plain text output")
+	root.PersistentFlags().Bool("plain", false, "Plain text output for scripting (no TUI)")
 
 	root.AddCommand(newExportCmd())
 	root.AddCommand(newImportCmd())

@@ -47,6 +47,14 @@ tasks:
     generates:
       - bin/diet
 
+  dev:install:
+    desc: "Install diet locally (go install → $GOBIN or $GOPATH/bin)"
+    cmd: go install ./cmd/diet
+    sources:
+      - "cmd/diet/**/*.go"
+      - go.mod
+      - go.sum
+
   # ---------------------------------------------------------------------------
   # DIET (Directus Import Export Tool)
   # ---------------------------------------------------------------------------

@@ -166,7 +166,7 @@ func newWizard() wizardModel {
 	cfg := loadConfig()
 	return wizardModel{
 		step:       stepOperation,
-		operations: []string{"Export", "Import", "Clean"},
+		operations: []string{"Export", "Import", "Clean", "Diff"},
 		cfg:        cfg,
 		width:      80,
 		height:     24,
@@ -276,11 +276,16 @@ func (m wizardModel) handleOperationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.operation++
 		}
 	case "enter":
-		if m.operation == 1 {
-			// Import: first ask for archive file.
+		switch m.operations[m.operation] {
+		case "Import":
 			m.step = stepImportFile
 			m.buildFileInput()
-		} else {
+		case "Diff":
+			// Short-circuit: runWizard will hand off to the dedicated
+			// diffPickerModel which has its own source/target flow.
+			m.done = true
+			return m, tea.Quit
+		default: // Export, Clean
 			m.goToProfileSelect(stepProfile)
 		}
 	case "q", "esc":
@@ -474,103 +479,252 @@ func (m wizardModel) result() wizardResult {
 
 // View
 
-func (m wizardModel) View() string {
-	w := m.width - 2
-	h := m.height - 2
-	if w < 40 {
-		w = 40
+// wizardBanner is the centered title block shown at the top of every step.
+func (m wizardModel) wizardBanner() string {
+	logo := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(borderColor).
+		Render("◆  D I E T")
+	tag := lipgloss.NewStyle().
+		Foreground(dimColor).
+		Render("Directus Import Export Tool")
+	ver := lipgloss.NewStyle().
+		Foreground(dimColor).
+		Render("v" + version)
+	return lipgloss.JoinVertical(lipgloss.Center, logo, tag, ver)
+}
+
+// wizardHints renders a row of colored key chips for the current step.
+func (m wizardModel) wizardHints() string {
+	switch m.step {
+	case stepNewProfile, stepNewTarget, stepImportFile:
+		return renderKeyHint("tab", "next field") + "   " +
+			renderKeyHint("enter", "confirm") + "   " +
+			renderKeyHint("esc", "back")
+	default:
+		return renderKeyHint("↑↓", "select") + "   " +
+			renderKeyHint("enter", "confirm") + "   " +
+			renderKeyHint("esc", "back") + "   " +
+			renderKeyHint("q", "quit")
 	}
-	if h < 6 {
-		h = 6
+}
+
+func (m wizardModel) View() string {
+	if m.width == 0 || m.height == 0 {
+		return ""
 	}
 
 	var body string
 	switch m.step {
 	case stepOperation:
-		body = m.viewList("DIET — Directus Import Export Tool", "Select operation:",
-			m.operations, m.operation, nil, h)
+		body = m.viewOperationStep()
 	case stepProfile:
-		body = m.viewList(m.operations[m.operation], "Select server:",
-			m.profileNames, m.profileIdx, m.cfg.Profiles, h)
+		body = m.viewProfileStep("Select source server", m.cfg.Profiles)
 	case stepImportTarget:
-		body = m.viewList(fmt.Sprintf("Import [%s]", m.inputFile), "Select target server:",
-			m.profileNames, m.profileIdx, m.cfg.Profiles, h)
+		body = m.viewProfileStep("Select target server", m.cfg.Profiles)
 	case stepNewProfile, stepNewTarget:
-		body = m.viewInputFields(h)
+		body = m.viewInputStep()
 	case stepImportFile:
-		body = m.viewInputFields(h)
+		body = m.viewInputStep()
 	}
 
-	frame := frameBorder.Width(w)
-	return frame.Render(body)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(1, 4).
+		Render(body)
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-func (m wizardModel) viewList(titleText, subtitle string, items []string, cursor int, profiles map[string]profile, h int) string {
-	title := titleBar.Render("◆ " + titleText)
-	sub := statusBar.Render(subtitle)
-
-	var rows []string
-	for i, item := range items {
-		cur := "  "
-		style := lipgloss.NewStyle().Foreground(dimColor).Padding(0, 1)
-		if i == cursor {
-			cur = "▸ "
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true).Padding(0, 1)
-		}
-
-		label := item
-		if profiles != nil {
-			if prof, ok := profiles[item]; ok && prof.URL != "" {
-				label = fmt.Sprintf("%-16s %s", item,
-					lipgloss.NewStyle().Foreground(dimColor).Render(prof.URL))
-			}
-		}
-		rows = append(rows, style.Render(cur+label))
-	}
-
-	help := helpBar.Render("↑↓: select  enter: confirm  esc: back  q: quit")
-
-	parts := []string{title, "", sub, ""}
-	parts = append(parts, rows...)
-	parts = append(parts, "", help)
-
-	return padToHeight(lipgloss.JoinVertical(lipgloss.Left, parts...), h)
-}
-
-func (m wizardModel) viewInputFields(h int) string {
-	var titleText string
+// stepLabel describes the current step in the breadcrumb-style sub-heading.
+func (m wizardModel) stepLabel() string {
 	switch m.step {
+	case stepOperation:
+		return "Choose operation"
+	case stepProfile:
+		return m.operations[m.operation] + " · choose source"
+	case stepImportTarget:
+		return fmt.Sprintf("Import · %s · choose target", filepathBase(m.inputFile))
 	case stepNewProfile:
-		titleText = fmt.Sprintf("%s — New profile", m.operations[m.operation])
+		return m.operations[m.operation] + " · new profile"
 	case stepNewTarget:
-		titleText = "Import — New target profile"
+		return "Import · new target profile"
 	case stepImportFile:
-		titleText = "Import — Archive"
-	default:
-		titleText = "DIET"
+		return "Import · archive path"
 	}
-	title := titleBar.Render("◆ " + titleText)
+	return ""
+}
+
+// operationDescriptions tracks the one-line description shown next to each
+// operation in the wizard's table. Keep entries aligned with the order
+// in newWizard().operations.
+var operationDescriptions = map[string]string{
+	"Export": "pack collections + system into an archive",
+	"Import": "restore from a diet archive",
+	"Clean":  "delete collections and system entities",
+	"Diff":   "compare two Directus instances",
+}
+
+func (m wizardModel) viewOperationStep() string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
+
+	const (
+		cursorW = 2
+		nameW   = 10
+		descW   = 44
+	)
+	tableW := cursorW + nameW + descW
+
+	// Table header.
+	headerStyle := lipgloss.NewStyle().
+		Foreground(labelCol).
+		Bold(true)
+	headerRow := strings.Repeat(" ", cursorW) +
+		headerStyle.Width(nameW).Render("OPERATION") +
+		headerStyle.Render("DESCRIPTION")
+	separator := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("236")).
+		Render(strings.Repeat(" ", cursorW) + strings.Repeat("─", nameW+descW-2))
+
+	// Body rows.
+	rows := []string{headerRow, separator}
+	for i, op := range m.operations {
+		isCursor := i == m.operation
+		isDanger := op == "Clean"
+
+		var cursor string
+		switch {
+		case isCursor && isDanger:
+			cursor = lipgloss.NewStyle().Foreground(dangerCol).Bold(true).Render("▸ ")
+		case isCursor:
+			cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
+		default:
+			cursor = "  "
+		}
+
+		nameStyle := lipgloss.NewStyle().Width(nameW)
+		switch {
+		case isCursor && isDanger:
+			nameStyle = nameStyle.Foreground(dangerCol).Bold(true)
+		case isCursor:
+			nameStyle = nameStyle.Foreground(valueCol).Bold(true)
+		case isDanger:
+			nameStyle = nameStyle.Foreground(dangerCol)
+		default:
+			nameStyle = nameStyle.Foreground(labelCol)
+		}
+
+		descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
+		if isCursor {
+			descStyle = descStyle.Italic(false)
+		}
+
+		rows = append(rows, cursor+nameStyle.Render(op)+descStyle.Render(operationDescriptions[op]))
+	}
+
+	body := lipgloss.NewStyle().Width(tableW).Render(
+		lipgloss.JoinVertical(lipgloss.Left, rows...))
+
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.wizardBanner(),
+		"",
+		heading,
+		"",
+		body,
+		"",
+		m.wizardHints(),
+	)
+}
+
+func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
+
+	rows := make([]string, len(m.profileNames))
+	for i, name := range m.profileNames {
+		desc := ""
+		if prof, ok := profiles[name]; ok && prof.URL != "" {
+			desc = prof.URL
+		}
+		isNew := i == len(m.profileNames)-1 // last entry is "+ New profile"
+		rows[i] = renderListRow(name, desc, i == m.profileIdx, isNew)
+	}
+
+	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
+
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.wizardBanner(),
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(56).Render(body),
+		"",
+		m.wizardHints(),
+	)
+}
+
+func (m wizardModel) viewInputStep() string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
 
 	var fields []string
 	for i, inp := range m.inputs {
-		label := m.labels[i]
-		labelStyle := lipgloss.NewStyle().Foreground(dimColor).Width(16).Align(lipgloss.Right)
+		labelStyle := lipgloss.NewStyle().
+			Foreground(labelCol).
+			Width(14).
+			Align(lipgloss.Right)
 		if i == m.focusIdx {
-			labelStyle = labelStyle.Foreground(lipgloss.Color("255")).Bold(true)
+			labelStyle = labelStyle.Foreground(valueCol).Bold(true)
 		}
 		fields = append(fields, lipgloss.JoinHorizontal(lipgloss.Top,
-			labelStyle.Render(label+": "),
+			labelStyle.Render(m.labels[i]+" "),
 			inp.View(),
 		))
 	}
 
-	help := helpBar.Render("tab/↑↓: switch  enter: confirm  esc: back")
+	body := lipgloss.JoinVertical(lipgloss.Left, fields...)
 
-	parts := []string{title, ""}
-	parts = append(parts, fields...)
-	parts = append(parts, "", help)
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.wizardBanner(),
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(64).Render(body),
+		"",
+		m.wizardHints(),
+	)
+}
 
-	return padToHeight(lipgloss.JoinVertical(lipgloss.Left, parts...), h)
+// renderListRow renders one selectable list row: cursor arrow, label,
+// dimmed description if any. The "danger" flag tints destructive options
+// (Clean) red so the operator can't pick it by accident in the dark.
+func renderListRow(label, desc string, selected, danger bool) string {
+	cursor := "  "
+	labelStyle := lipgloss.NewStyle().Foreground(dimColor)
+	descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
+
+	switch {
+	case selected && danger:
+		cursor = lipgloss.NewStyle().Foreground(dangerCol).Bold(true).Render("▸ ")
+		labelStyle = labelStyle.Foreground(dangerCol).Bold(true)
+	case selected:
+		cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
+		labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+	case danger:
+		labelStyle = labelStyle.Foreground(dangerCol)
+	}
+
+	left := cursor + labelStyle.Render(fmt.Sprintf("%-18s", label))
+	if desc != "" {
+		return left + " " + descStyle.Render(desc)
+	}
+	return left
+}
+
+func filepathBase(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // Run wizard and dispatch
@@ -627,6 +781,25 @@ func runWizard() error {
 		if pm.quitting && !pm.done {
 			fmt.Println("Cancelled.")
 		}
+
+	case "diff":
+		// Hand off to the diff picker, seeded with the wizard's config so
+		// any newly-added profiles are immediately available.
+		dpm := newDiffPickerModel(m.cfg)
+		dp := tea.NewProgram(dpm, tea.WithAltScreen())
+		finalDiff, err := dp.Run()
+		if err != nil {
+			return err
+		}
+		dm := finalDiff.(diffPickerModel)
+		if dm.cancelled || dm.result == nil {
+			fmt.Println("Cancelled.")
+			return nil
+		}
+		if dm.errMsg != "" {
+			return fmt.Errorf("%s", dm.errMsg)
+		}
+		return showDiffResult(dm.result)
 	}
 
 	return nil

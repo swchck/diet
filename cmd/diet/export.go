@@ -26,7 +26,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	token, _ := cmd.Flags().GetString("token")
 	output, _ := cmd.Flags().GetString("output")
 	format, _ := cmd.Flags().GetString("format")
-	simpleUI, _ := cmd.Flags().GetBool("simpleui")
+	plain, _ := cmd.Flags().GetBool("plain")
 	all, _ := cmd.Flags().GetBool("all")
 
 	if url == "" || token == "" {
@@ -35,7 +35,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 
 	client := newClient(url, token)
 
-	if simpleUI || all {
+	if plain || all {
 		return runSimpleExport(client, url, output, format, all)
 	}
 
@@ -58,7 +58,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runSimpleExport handles --simpleui and --all modes (no TUI).
+// runSimpleExport handles --plain and --all modes (no TUI).
 func runSimpleExport(client *apiClient, sourceURL, output, format string, all bool) error {
 	fmt.Println("Connecting to", sourceURL)
 	collections, err := fetchCollections(client)

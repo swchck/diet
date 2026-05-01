@@ -83,13 +83,13 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	sourceToken, _ := cmd.Flags().GetString("token")
 	targetURL, _ := cmd.Flags().GetString("target-url")
 	targetToken, _ := cmd.Flags().GetString("target-token")
-	simpleUI, _ := cmd.Flags().GetBool("simpleui")
+	plain, _ := cmd.Flags().GetBool("plain")
 
 	// If all flags provided, run directly.
 	if sourceURL != "" && sourceToken != "" && targetURL != "" && targetToken != "" {
 		source := newClient(sourceURL, sourceToken)
 		target := newClient(targetURL, targetToken)
-		if simpleUI {
+		if plain {
 			return runSimpleDiff(source, target, sourceURL, targetURL)
 		}
 		result, err := computeDiff(source, target, sourceURL, targetURL, func(string) {})
@@ -660,102 +660,132 @@ func (m diffPickerModel) startDiff() tea.Cmd {
 }
 
 func (m diffPickerModel) View() string {
-	w := max(m.width-2, 40)
-	h := max(m.height-2, 6)
-
-	title := titleBar.Render("◆ Diet Diff")
+	if m.width == 0 || m.height == 0 {
+		return ""
+	}
 
 	var body string
 	switch m.step {
 	case diffPickSource:
-		body = m.viewProfileList("Select source instance:", m.sourceIdx, -1)
+		body = m.viewSelectStep("source", m.sourceIdx, -1)
 	case diffPickTarget:
-		body = m.viewProfileList("Select target instance:", m.targetIdx, m.sourceIdx)
+		body = m.viewSelectStep("target", m.targetIdx, m.sourceIdx)
 	case diffPickNewProfile:
-		body = m.viewNewProfileForm()
+		body = m.viewNewProfileStep()
 	case diffPickLoading:
-		spin := spinChars[m.spinFrame%len(spinChars)]
-		srcName := m.names[m.sourceIdx]
-		tgtName := m.names[m.targetIdx]
-		body = lipgloss.NewStyle().Padding(1, 1).Render(
-			fmt.Sprintf("%s Comparing %s ←→ %s ...",
-				lipgloss.NewStyle().Foreground(warnColor).Render(spin),
-				lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(srcName),
-				lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(tgtName),
-			))
+		body = m.viewLoadingStep()
 	}
 
-	var helpText string
-	switch m.step {
-	case diffPickNewProfile:
-		helpText = "tab:next  shift+tab:prev  enter:save  esc:back"
-	default:
-		helpText = "↑/↓:move  enter:select  esc:back  q:quit"
-	}
-	help := helpBar.Render(helpText)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(1, 4).
+		Render(body)
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", help)
-	content = padToHeight(content, h)
-	frame := frameBorder.Width(w)
-	return frame.Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-func (m diffPickerModel) viewProfileList(prompt string, cursor, disabledIdx int) string {
-	dim := lipgloss.NewStyle().Foreground(dimColor)
-	sel := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("255"))
-	urlStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	disabledStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("236"))
+func (m diffPickerModel) banner() string {
+	logo := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(borderColor).
+		Render("◆  D I E T   ⇄   D I F F")
+	tag := lipgloss.NewStyle().
+		Foreground(dimColor).
+		Render("Compare two Directus instances side by side")
+	return lipgloss.JoinVertical(lipgloss.Center, logo, tag)
+}
 
-	var lines []string
-	lines = append(lines,
-		lipgloss.NewStyle().Padding(0, 1).Bold(true).Foreground(lipgloss.Color("255")).Render(prompt),
-		"")
+func (m diffPickerModel) viewSelectStep(role string, cursor, disabledIdx int) string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).
+		Render("Choose " + role + " instance")
 
+	rows := make([]string, len(m.names))
 	for i, name := range m.names {
-		prefix := "  "
-		if i == cursor {
-			prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("▸ ")
-		}
-
-		// "+ New profile" entry.
-		if m.isNewProfile(i) {
-			label := dim.Render(name)
-			if i == cursor {
-				label = lipgloss.NewStyle().Bold(true).Foreground(okColor).Render(name)
+		isNew := m.isNewProfile(i)
+		desc := ""
+		if !isNew {
+			if prof, ok := m.cfg.Profiles[name]; ok && prof.URL != "" {
+				desc = prof.URL
 			}
-			lines = append(lines, prefix+label)
-			continue
 		}
-
-		prof := m.cfg.Profiles[name]
-
 		if i == disabledIdx {
-			lines = append(lines, disabledStyle.Render(fmt.Sprintf("  %s  %s  (source)", name, prof.URL)))
+			rows[i] = lipgloss.NewStyle().Foreground(lipgloss.Color("236")).
+				Render(fmt.Sprintf("  %-18s %s  (already source)", name, desc))
 			continue
 		}
-
-		label := dim.Render(name)
-		url := dim.Render(prof.URL)
-		if i == cursor {
-			label = sel.Render(name)
-			url = urlStyle.Render(prof.URL)
-		}
-		lines = append(lines, fmt.Sprintf("%s%s  %s", prefix, label, url))
+		rows[i] = renderListRow(name, desc, i == cursor, isNew)
 	}
 
-	return strings.Join(lines, "\n")
+	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
+
+	hints := renderKeyHint("↑↓", "select") + "   " +
+		renderKeyHint("enter", "confirm") + "   " +
+		renderKeyHint("esc", "back") + "   " +
+		renderKeyHint("q", "quit")
+
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.banner(),
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(64).Render(body),
+		"",
+		hints,
+	)
 }
 
-func (m diffPickerModel) viewNewProfileForm() string {
-	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true).Width(8)
-	var lines []string
-	lines = append(lines,
-		lipgloss.NewStyle().Padding(0, 1).Bold(true).Foreground(lipgloss.Color("255")).Render("New profile:"),
-		"")
+func (m diffPickerModel) viewNewProfileStep() string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).Render("New profile")
+
+	var fields []string
 	for i, inp := range m.inputs {
-		lines = append(lines, fmt.Sprintf("  %s %s", labelStyle.Render(m.labels[i]), inp.View()))
+		labelStyle := lipgloss.NewStyle().
+			Foreground(labelCol).
+			Width(10).
+			Align(lipgloss.Right)
+		if i == m.focusIdx {
+			labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+		}
+		fields = append(fields, lipgloss.JoinHorizontal(lipgloss.Top,
+			labelStyle.Render(m.labels[i]+" "),
+			inp.View(),
+		))
 	}
-	return strings.Join(lines, "\n")
+	body := lipgloss.JoinVertical(lipgloss.Left, fields...)
+
+	hints := renderKeyHint("tab", "next field") + "   " +
+		renderKeyHint("enter", "save") + "   " +
+		renderKeyHint("esc", "back")
+
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.banner(),
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(56).Render(body),
+		"",
+		hints,
+	)
+}
+
+func (m diffPickerModel) viewLoadingStep() string {
+	spin := spinChars[m.spinFrame%len(spinChars)]
+	srcName := m.names[m.sourceIdx]
+	tgtName := m.names[m.targetIdx]
+
+	msg := fmt.Sprintf("%s Comparing %s  ⇄  %s",
+		lipgloss.NewStyle().Foreground(warnColor).Render(spin),
+		lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render(srcName),
+		lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render(tgtName))
+
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.banner(),
+		"",
+		msg,
+		"",
+		renderKeyHint("q", "cancel"),
+	)
 }
 
 // Diff result viewer TUI
@@ -942,45 +972,56 @@ func (m diffModel) fetchDataDiff(collection string) tea.Cmd {
 }
 
 func (m diffModel) View() string {
-	w := max(m.width-2, 40)
-
-	title := titleBar.Render("◆ Diet Diff")
-	source := lipgloss.NewStyle().Padding(0, 1).Render(
-		fmt.Sprintf("%s  ←→  %s",
-			lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render(m.result.sourceURL),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render(m.result.targetURL),
-		))
+	w := m.width
+	h := m.height
+	if w < 40 {
+		w = 40
+	}
+	if h < 6 {
+		h = 6
+	}
 
 	if m.inspecting {
-		return m.viewInspect(w, title, source)
+		return m.viewInspect(w, h)
 	}
-	return m.viewMain(w, title, source)
+	return m.viewMain(w, h)
 }
 
-func (m diffModel) viewMain(w int, title, source string) string {
-	h := max(m.height-2, 6)
-
-	// Build collection list with cursor.
-	var listLines []string
-	visH := max(
-		// space for title, source, summary, help, borders
-		h-8, 3)
-
-	// Adjust scroll offset.
-	if m.cursor < m.scrollOff {
-		m.scrollOff = m.cursor
+// renderDiffHeader renders a two-column k9s-style header showing both
+// source and target connection details.
+func (m diffModel) renderDiffHeader(w int) string {
+	srcToken, tgtToken := "—", "—"
+	if m.result.sourceClient != nil {
+		srcToken = maskToken(m.result.sourceClient.token)
 	}
-	if m.cursor >= m.scrollOff+visH {
-		m.scrollOff = m.cursor - visH + 1
+	if m.result.targetClient != nil {
+		tgtToken = maskToken(m.result.targetClient.token)
 	}
 
-	for vi := m.scrollOff; vi < len(m.visibleCols) && vi < m.scrollOff+visH; vi++ {
-		c := m.result.collections[m.visibleCols[vi]]
-		isCursor := vi == m.cursor
-		listLines = append(listLines, renderDiffRow(c, isCursor))
+	row := func(label, value string) string {
+		return headerLabelStyle.Render(fmt.Sprintf("%-7s", label)) + " " +
+			headerValueStyle.Render(value)
 	}
 
-	// Summary bar.
+	colW := max(w/2-2, 20)
+	leftRows := []string{
+		row("Source", truncate(m.result.sourceURL, colW-12)),
+		row("Token", srcToken),
+	}
+	rightRows := []string{
+		row("Target", truncate(m.result.targetURL, colW-12)),
+		row("Token", tgtToken),
+	}
+
+	left := lipgloss.JoinVertical(lipgloss.Left, leftRows...)
+	right := lipgloss.JoinVertical(lipgloss.Left, rightRows...)
+	leftCol := lipgloss.NewStyle().Width(w / 2).Padding(0, 1).Render(left)
+	rightCol := lipgloss.NewStyle().Padding(0, 1).Render(right)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+}
+
+// summaryChips formats the diff totals as colored chips.
+func (m diffModel) summaryChips() string {
 	added, removed, changed, matched := 0, 0, 0, 0
 	for _, c := range m.result.collections {
 		switch c.status {
@@ -994,55 +1035,103 @@ func (m diffModel) viewMain(w int, title, source string) string {
 			matched++
 		}
 	}
-	var sumParts []string
-	sumParts = append(sumParts, fmt.Sprintf("%d collections", added+removed+changed+matched))
+
+	chip := func(bg lipgloss.Color, text string) string {
+		return lipgloss.NewStyle().
+			Background(bg).
+			Foreground(lipgloss.Color("16")).
+			Bold(true).
+			Padding(0, 1).
+			Render(text)
+	}
+	muted := func(text string) string {
+		return lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Foreground(lipgloss.Color("250")).
+			Padding(0, 1).
+			Render(text)
+	}
+
+	parts := []string{muted(fmt.Sprintf("%d total", added+removed+changed+matched))}
 	if changed > 0 {
-		sumParts = append(sumParts, diffChgStyle.Render(fmt.Sprintf("%d changed", changed)))
+		parts = append(parts, chip(lipgloss.Color("214"), fmt.Sprintf("~ %d changed", changed)))
 	}
 	if added > 0 {
-		sumParts = append(sumParts, diffAddStyle.Render(fmt.Sprintf("%d source-only", added)))
+		parts = append(parts, chip(lipgloss.Color("42"), fmt.Sprintf("+ %d source-only", added)))
 	}
 	if removed > 0 {
-		sumParts = append(sumParts, diffRemStyle.Render(fmt.Sprintf("%d target-only", removed)))
+		parts = append(parts, chip(lipgloss.Color("203"), fmt.Sprintf("− %d target-only", removed)))
 	}
 	if matched > 0 {
-		sumParts = append(sumParts, diffMatchStyle.Render(fmt.Sprintf("%d identical", matched)))
+		parts = append(parts, muted(fmt.Sprintf("= %d identical", matched)))
 	}
-	summary := "  " + strings.Join(sumParts, diffMatchStyle.Render(" · "))
-	sep := diffSepStyle.Render("  " + strings.Repeat("─", max(w-4, 1)))
-
-	list := strings.Join(listLines, "\n")
-	help := helpBar.Render("↑/↓:navigate  i:inspect data  q:quit")
-
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		title, source, summary, sep, "", list, "", help)
-	content = padToHeight(content, h)
-
-	frame := frameBorder.Width(w)
-	return frame.Render(content)
+	return lipgloss.NewStyle().Padding(0, 1).Render(strings.Join(parts, " "))
 }
 
-func (m diffModel) viewInspect(w int, title, source string) string {
-	h := max(m.height-2, 6)
+func (m diffModel) viewMain(w, h int) string {
+	title := titleBar.Render("◆ Diet › Diff")
+	header := m.renderDiffHeader(w)
+	summary := m.summaryChips()
 
-	colTitle := titleBar.Render(fmt.Sprintf("◆ %s — Data Diff", m.inspectCol))
-	help := helpBar.Render("↑/↓:scroll  esc:back")
+	keyBar := renderKeyBar(w-2,
+		[2]string{"↑↓", "navigate"},
+		[2]string{"i", "inspect data"},
+		[2]string{"q", "quit"})
+
+	// chrome lines reserved for non-list content:
+	//   title(1) + header(2) + blank(1) + summary(1) + blank(1) + blank-before-keybar(1) + keybar(1) = 8
+	chrome := 8
+	visH := max(h-chrome, 3)
+
+	if m.cursor < m.scrollOff {
+		m.scrollOff = m.cursor
+	}
+	if m.cursor >= m.scrollOff+visH {
+		m.scrollOff = m.cursor - visH + 1
+	}
+
+	var listLines []string
+	for vi := m.scrollOff; vi < len(m.visibleCols) && vi < m.scrollOff+visH; vi++ {
+		c := m.result.collections[m.visibleCols[vi]]
+		listLines = append(listLines, renderDiffRow(c, vi == m.cursor))
+	}
+	if len(listLines) == 0 {
+		listLines = []string{lipgloss.NewStyle().Foreground(okColor).Render("✓ All collections identical")}
+	}
+
+	list := lipgloss.NewStyle().Padding(0, 1).Render(strings.Join(listLines, "\n"))
+	keyBarLine := lipgloss.NewStyle().Padding(0, 1).Render(keyBar)
+
+	return padToHeight(lipgloss.JoinVertical(lipgloss.Left,
+		title, header, "", summary, "", list, "", keyBarLine), h)
+}
+
+func (m diffModel) viewInspect(w, h int) string {
+	colTitle := titleBar.Render("◆ Diet › Diff › " + m.inspectCol)
+	keyBar := renderKeyBar(w-2,
+		[2]string{"↑↓", "scroll"},
+		[2]string{"esc", "back"})
 
 	var body string
 	if m.inspectLoad {
 		spin := spinChars[0]
 		body = lipgloss.NewStyle().Padding(1, 1).Render(
-			fmt.Sprintf("%s Fetching items from both instances...",
-				lipgloss.NewStyle().Foreground(warnColor).Render(spin)))
+			fmt.Sprintf("%s %s",
+				lipgloss.NewStyle().Foreground(warnColor).Render(spin),
+				lipgloss.NewStyle().Foreground(valueCol).Render("Fetching items from both instances...")))
 	} else if m.inspectReady {
-		body = m.inspectVP.View()
+		body = lipgloss.NewStyle().Padding(0, 1).Render(m.inspectVP.View())
 	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left, colTitle, source, "", body, help)
-	content = padToHeight(content, h)
-	frame := frameBorder.Width(w)
-	return frame.Render(content)
+	keyBarLine := lipgloss.NewStyle().Padding(0, 1).Render(keyBar)
+	return padToHeight(lipgloss.JoinVertical(lipgloss.Left,
+		colTitle, "", body, "", keyBarLine), h)
 }
+
+// diffRowNameW caps the visible width of a collection name in the list so
+// that each diff row stays on one terminal line. Names longer than this are
+// truncated with an ellipsis — the full name is always available via inspect.
+const diffRowNameW = 34
 
 func renderDiffRow(c collectionDiff, isCursor bool) string {
 	cursor := "  "
@@ -1050,21 +1139,26 @@ func renderDiffRow(c collectionDiff, isCursor bool) string {
 		cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("▸ ")
 	}
 
-	var prefix, name, detail string
+	// Truncate the plain name first; styling is applied after so ANSI
+	// escape codes never reach the truncate / Width call (both count
+	// printable runes only).
+	plainName := truncate(c.name, diffRowNameW)
+
+	var prefix, styledName, detail string
 
 	switch c.status {
 	case diffChanged:
 		prefix = diffChgStyle.Render("~")
-		name = c.name
 		if isCursor {
-			name = diffHeaderStyle.Render(c.name)
+			styledName = diffHeaderStyle.Render(plainName)
+		} else {
+			styledName = plainName
 		}
 		if c.sourceItems != c.targetItems {
 			detail = diffChgStyle.Render(itemCountDiff(c.sourceItems, c.targetItems))
 		} else {
 			detail = diffMatchStyle.Render(fmt.Sprintf("%d items", c.sourceItems))
 		}
-		// Count field diffs.
 		fieldChanges := 0
 		for _, f := range c.fields {
 			if f.status != diffMatch {
@@ -1076,15 +1170,16 @@ func renderDiffRow(c collectionDiff, isCursor bool) string {
 		}
 	case diffAdded:
 		prefix = diffAddStyle.Render("+")
-		name = diffAddStyle.Render(c.name)
+		styledName = diffAddStyle.Render(plainName)
 		detail = diffMatchStyle.Render(fmt.Sprintf("%d items (source only)", c.sourceItems))
 	case diffRemoved:
 		prefix = diffRemStyle.Render("−")
-		name = diffRemStyle.Render(c.name)
+		styledName = diffRemStyle.Render(plainName)
 		detail = diffMatchStyle.Render(fmt.Sprintf("%d items (target only)", c.targetItems))
 	}
 
-	return fmt.Sprintf("%s%s %-34s %s", cursor, prefix, name, detail)
+	nameCol := lipgloss.NewStyle().Width(diffRowNameW).Render(styledName)
+	return cursor + prefix + " " + nameCol + " " + detail
 }
 
 // Data diff: compare items by content (ignoring id and system fields)

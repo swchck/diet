@@ -33,13 +33,13 @@ func runImport(cmd *cobra.Command, args []string) error {
 	email, _ := cmd.Flags().GetString("email")
 	password, _ := cmd.Flags().GetString("password")
 	importData, _ := cmd.Flags().GetBool("data")
-	simpleUI, _ := cmd.Flags().GetBool("simpleui")
+	plain, _ := cmd.Flags().GetBool("plain")
 
 	client := newClient(targetURL, targetToken)
 	client.email = email
 	client.password = password
 
-	return executeImport(client, input, importData, !simpleUI)
+	return executeImport(client, input, importData, !plain)
 }
 
 func executeImport(client *apiClient, inputFile string, importData, useTUI bool) error {

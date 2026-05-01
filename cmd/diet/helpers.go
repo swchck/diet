@@ -6,12 +6,19 @@ import (
 	"strings"
 )
 
+// truncate clamps a string to at most n visible runes, with an ellipsis
+// substituted for the trailing characters when needed. Returned width is
+// always ≤ n, so callers can pair this with lipgloss.Width(n) without
+// accidental line wrapping.
 func truncate(s string, n int) string {
 	runes := []rune(s)
-	if len(runes) > n {
-		return string(runes[:n]) + "..."
+	if len(runes) <= n {
+		return s
 	}
-	return s
+	if n <= 3 {
+		return string(runes[:n])
+	}
+	return string(runes[:n-3]) + "..."
 }
 
 // stripDataFields removes virtual alias fields and system user FKs from an item payload.

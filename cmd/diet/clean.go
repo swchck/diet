@@ -22,7 +22,7 @@ func newCleanCmd() *cobra.Command {
 func runClean(cmd *cobra.Command, args []string) error {
 	url, _ := cmd.Flags().GetString("url")
 	token, _ := cmd.Flags().GetString("token")
-	simpleUI, _ := cmd.Flags().GetBool("simpleui")
+	plain, _ := cmd.Flags().GetBool("plain")
 	all, _ := cmd.Flags().GetBool("all")
 	system, _ := cmd.Flags().GetBool("system")
 
@@ -32,7 +32,7 @@ func runClean(cmd *cobra.Command, args []string) error {
 
 	client := newClient(url, token)
 
-	if simpleUI || all {
+	if plain || all {
 		return runSimpleClean(client, url, all, system)
 	}
 

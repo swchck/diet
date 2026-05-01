@@ -89,7 +89,7 @@ diet diff
 |------|-------------|
 | `--url` | Directus instance URL |
 | `--token` | Static access token |
-| `--simpleui` | Disable TUI, use plain text output |
+| `--plain` | Plain text output for scripting (no TUI) |
 
 Per-profile tuning (set in `~/.config/diet/config.yml` via the wizard):
 
@@ -133,7 +133,7 @@ Local Directus runs at `http://localhost:8055` with credentials `admin@example.c
 ```bash
 # Build and test against local instance
 go build -o bin/diet ./cmd/diet
-./bin/diet export --url=http://localhost:8055 --token=e2e-test-token --all --simpleui
+./bin/diet export --url=http://localhost:8055 --token=e2e-test-token --all --plain
 
 # Run tests
 go test ./cmd/diet/ -v

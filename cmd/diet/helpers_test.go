@@ -12,11 +12,12 @@ func TestTruncate(t *testing.T) {
 		want  string
 	}{
 		{"hello", 10, "hello"},
-		{"hello world", 5, "hello..."},
+		{"hello world", 5, "he..."},
 		{"", 5, ""},
 		{"abc", 3, "abc"},
-		{"abcd", 3, "abc..."},
-		{"привет мир", 6, "привет..."},
+		{"abcd", 3, "abc"},   // n<=3: no ellipsis (would exceed n)
+		{"abcdefgh", 6, "abc..."},
+		{"привет мир", 6, "при..."}, // 6 runes total: "при" + "..."
 	}
 	for _, tt := range tests {
 		got := truncate(tt.input, tt.n)
