@@ -171,6 +171,30 @@ func isNullOrEmpty(raw json.RawMessage) bool {
 	return len(raw) == 0 || string(raw) == "null"
 }
 
+// stripAccountability rewrites meta.accountability="null" on every
+// collection in schema. Directus uses that field to decide whether each
+// write goes to directus_activity (audit log) and directus_revisions
+// (full row snapshots). Setting it to null skips both, which on large
+// data imports is the difference between a 90s and a 30s run — the audit
+// path roughly doubles per-row CPU on the Directus side.
+//
+// Returns the number of collections touched. Reversible via Directus UI
+// after import: collection settings → "Activity & Revisions Tracking".
+func stripAccountability(schema *SchemaBundle) int {
+	n := 0
+	for i := range schema.Collections {
+		c := &schema.Collections[i]
+		var meta map[string]json.RawMessage
+		if err := json.Unmarshal(c.Meta, &meta); err != nil {
+			meta = map[string]json.RawMessage{}
+		}
+		meta["accountability"] = json.RawMessage("null")
+		c.Meta, _ = json.Marshal(meta)
+		n++
+	}
+	return n
+}
+
 // classifySchemaError turns a Directus error response into a typed Go error,
 // promoting "payload too large" and version-mismatch into actionable
 // messages so the caller can decide whether to fall back.

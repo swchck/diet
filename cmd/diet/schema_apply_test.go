@@ -240,6 +240,61 @@ func anyContains(logs []string, needle string) bool {
 
 // Sanity check that a real-world-ish snapshot makes it through the build
 // pipeline without panics or losing fields.
+func TestStripAccountability_OverwritesAllValues(t *testing.T) {
+	schema := SchemaBundle{
+		Collections: []CollectionInfo{
+			{Collection: "a", Meta: json.RawMessage(`{"icon":"x","accountability":"all"}`)},
+			{Collection: "b", Meta: json.RawMessage(`{"icon":"y","accountability":"activity"}`)},
+			{Collection: "c", Meta: json.RawMessage(`{"icon":"z"}`)}, // no accountability key
+			{Collection: "d", Meta: json.RawMessage(`{"icon":"w","accountability":null}`)},
+		},
+	}
+	n := stripAccountability(&schema)
+	if n != 4 {
+		t.Errorf("touched %d, want 4 (every collection)", n)
+	}
+	for _, c := range schema.Collections {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(c.Meta, &m); err != nil {
+			t.Fatalf("%s: %v", c.Collection, err)
+		}
+		acc, ok := m["accountability"]
+		if !ok {
+			t.Errorf("%s: accountability key missing", c.Collection)
+			continue
+		}
+		if string(acc) != "null" {
+			t.Errorf("%s: accountability = %s, want null", c.Collection, acc)
+		}
+		// Other keys preserved.
+		if _, ok := m["icon"]; !ok {
+			t.Errorf("%s: icon dropped", c.Collection)
+		}
+	}
+}
+
+func TestStripAccountability_HandlesGarbageMeta(t *testing.T) {
+	schema := SchemaBundle{
+		Collections: []CollectionInfo{
+			{Collection: "broken", Meta: json.RawMessage(`not json at all`)},
+			{Collection: "empty", Meta: json.RawMessage(``)},
+		},
+	}
+	n := stripAccountability(&schema)
+	if n != 2 {
+		t.Errorf("touched %d, want 2", n)
+	}
+	for _, c := range schema.Collections {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(c.Meta, &m); err != nil {
+			t.Fatalf("%s: result not valid JSON: %v", c.Collection, err)
+		}
+		if string(m["accountability"]) != "null" {
+			t.Errorf("%s: accountability = %s, want null", c.Collection, m["accountability"])
+		}
+	}
+}
+
 func TestBuildSnapshot_RoundTripSize(t *testing.T) {
 	colls := make([]CollectionInfo, 100)
 	for i := range colls {

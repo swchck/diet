@@ -1,6 +1,18 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # DEV-ONLY: disable durability for raw insert throughput. Postgres acks
+    # writes before fsync, so a crash mid-import loses recent transactions.
+    # Fine for ephemeral local stacks; never use this against a real volume
+    # you care about.
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=off
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
     environment:
       POSTGRES_DB: directus
       POSTGRES_USER: directus
@@ -45,8 +57,13 @@ services:
       WEBSOCKETS_ENABLED: "true"
       MAX_PAYLOAD_SIZE: "10mb"
       DB_POOL_MAX: "40"
-      LOGGER_LEVEL: "warn"
+      LOGGER_LEVEL: "fatal"
       CACHE_ENABLED: "false"
+      RATE_LIMITER_ENABLED: "false"
+      PRESSURE_LIMITER_ENABLED: "false"
+      TELEMETRY: "false"
+      GRAPHQL_ENABLED: "false"
+      EXTENSIONS_AUTO_RELOAD: "false"
     depends_on:
       postgres:
         condition: service_healthy
