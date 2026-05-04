@@ -170,11 +170,11 @@ func TestIsPrimaryKey(t *testing.T) {
 //   - the call respects client.Concurrency.
 func TestCreateFields_Parallel(t *testing.T) {
 	var (
-		postCount atomic.Int64
-		patchCount atomic.Int64
-		inFlight   atomic.Int64
-		peak       atomic.Int64
-		mu         sync.Mutex
+		postCount    atomic.Int64
+		patchCount   atomic.Int64
+		inFlight     atomic.Int64
+		peak         atomic.Int64
+		mu           sync.Mutex
 		postedFields = map[string]bool{}
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
