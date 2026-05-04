@@ -25,6 +25,14 @@ func main() {
 	root.PersistentFlags().String("token", "", "Source Directus static token")
 	root.PersistentFlags().Bool("plain", false, "Plain text output for scripting (no TUI)")
 
+	// HTTP client tuning. Zero means "use the package default" — see
+	// clientOptions in client.go. Mirrored in YAML profile fields, so both
+	// CLI flags and config can drive them.
+	root.PersistentFlags().Int("concurrency", 0, "Parallel HTTP workers (default 6)")
+	root.PersistentFlags().Int("timeout", 0, "HTTP timeout in seconds (default 60)")
+	root.PersistentFlags().Int("batch-size", 0, "Items per batch POST (default 100)")
+	root.PersistentFlags().Int("retry-passes", 0, "Max retry passes for FK failures (default 5)")
+
 	root.AddCommand(newExportCmd())
 	root.AddCommand(newImportCmd())
 	root.AddCommand(newCleanCmd())

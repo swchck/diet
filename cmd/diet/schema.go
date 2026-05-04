@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Types
@@ -198,7 +199,9 @@ func createCollections(client *apiClient, collections []CollectionInfo, fields [
 }
 
 func createFields(client *apiClient, fields []FieldInfo, log func(string)) error {
-	// Sort fields by collection, then by meta.sort.
+	// Sort fields by collection, then by meta.sort. Order is informational
+	// only once we go parallel — Directus assigns its own sort to each field
+	// at creation time based on insertion order, so we PATCH it back below.
 	sort.Slice(fields, func(i, j int) bool {
 		if fields[i].Collection != fields[j].Collection {
 			return fields[i].Collection < fields[j].Collection
@@ -214,13 +217,16 @@ func createFields(client *apiClient, fields []FieldInfo, log func(string)) error
 		return si < sj
 	})
 
-	created, skipped := 0, 0
+	// Skip PK fields — created with the collection.
+	work := make([]FieldInfo, 0, len(fields))
 	for _, f := range fields {
-		// Skip PK fields — created with the collection.
-		if isPrimaryKey(f) {
-			continue
+		if !isPrimaryKey(f) {
+			work = append(work, f)
 		}
+	}
 
+	var created, skipped atomic.Int64
+	err := runParallel(client, work, func(f FieldInfo) error {
 		// Build payload: strip meta.id (instance-specific).
 		meta := stripMetaID(f.Meta)
 
@@ -239,36 +245,53 @@ func createFields(client *apiClient, fields []FieldInfo, log func(string)) error
 			return fmt.Errorf("create field %s.%s: %w", f.Collection, f.Field, err)
 		}
 		if status >= 200 && status < 300 {
-			created++
+			created.Add(1)
 		} else {
-			skipped++
+			skipped.Add(1)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	log(fmt.Sprintf("Fields: %d created, %d skipped", created, skipped))
+	log(fmt.Sprintf("Fields: %d created, %d skipped", created.Load(), skipped.Load()))
 
 	// Reorder: PATCH meta.sort for fields that have an explicit sort value.
-	reordered := 0
-	for _, f := range fields {
+	// Mandatory after parallel creation — Directus renumbers meta.sort based
+	// on the order POSTs land on the server, which is non-deterministic
+	// across goroutines.
+	type reorderTask struct {
+		f       FieldInfo
+		sortVal int
+	}
+	reorderWork := make([]reorderTask, 0, len(work))
+	for _, f := range work {
 		if sortVal, ok := fieldSort(f); ok {
-			if err := client.patch(
-				fmt.Sprintf("/fields/%s/%s", url.PathEscape(f.Collection), url.PathEscape(f.Field)),
-				map[string]any{"meta": map[string]any{"sort": sortVal}},
-			); err == nil {
-				reordered++
-			}
+			reorderWork = append(reorderWork, reorderTask{f: f, sortVal: sortVal})
 		}
 	}
-	if reordered > 0 {
-		log(fmt.Sprintf("Fields: %d reordered", reordered))
+
+	var reordered atomic.Int64
+	_ = runParallel(client, reorderWork, func(t reorderTask) error {
+		if err := client.patch(
+			fmt.Sprintf("/fields/%s/%s", url.PathEscape(t.f.Collection), url.PathEscape(t.f.Field)),
+			map[string]any{"meta": map[string]any{"sort": t.sortVal}},
+		); err == nil {
+			reordered.Add(1)
+		}
+		return nil
+	})
+	if r := reordered.Load(); r > 0 {
+		log(fmt.Sprintf("Fields: %d reordered", r))
 	}
 
 	return nil
 }
 
 func createRelations(client *apiClient, relations []RelationInfo, log func(string)) error {
-	created, skipped := 0, 0
-	for _, r := range relations {
+	var created, skipped atomic.Int64
+	err := runParallel(client, relations, func(r RelationInfo) error {
 		meta := stripMetaID(r.Meta)
 		payload := map[string]any{
 			"collection":         r.Collection,
@@ -285,12 +308,16 @@ func createRelations(client *apiClient, relations []RelationInfo, log func(strin
 			return fmt.Errorf("create relation %s.%s: %w", r.Collection, r.Field, err)
 		}
 		if status >= 200 && status < 300 {
-			created++
+			created.Add(1)
 		} else {
-			skipped++
+			skipped.Add(1)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	log(fmt.Sprintf("Relations: %d created, %d skipped", created, skipped))
+	log(fmt.Sprintf("Relations: %d created, %d skipped", created.Load(), skipped.Load()))
 	return nil
 }
 

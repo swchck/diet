@@ -20,6 +20,8 @@ func newImportCmd() *cobra.Command {
 	cmd.Flags().String("email", "", "Admin email for token refresh")
 	cmd.Flags().String("password", "", "Admin password for token refresh")
 	cmd.Flags().Bool("data", true, "Also import item data")
+	cmd.Flags().Bool("bulk-schema", true, "Use Directus /schema/apply for schema (10-40× faster). Falls back to per-field on error.")
+	cmd.Flags().Bool("strip-accountability", false, "Set meta.accountability=null on imported collections (skip activity + revisions logging — ~2-3× faster data import)")
 	_ = cmd.MarkFlagRequired("input")
 	_ = cmd.MarkFlagRequired("target-url")
 	_ = cmd.MarkFlagRequired("target-token")
@@ -33,16 +35,32 @@ func runImport(cmd *cobra.Command, args []string) error {
 	email, _ := cmd.Flags().GetString("email")
 	password, _ := cmd.Flags().GetString("password")
 	importData, _ := cmd.Flags().GetBool("data")
+	bulkSchema, _ := cmd.Flags().GetBool("bulk-schema")
+	stripAcc, _ := cmd.Flags().GetBool("strip-accountability")
 	plain, _ := cmd.Flags().GetBool("plain")
 
-	client := newClient(targetURL, targetToken)
+	client := newClientWithOptions(targetURL, targetToken, clientOptionsFromFlags(cmd))
 	client.email = email
 	client.password = password
 
-	return executeImport(client, input, importData, !plain)
+	return executeImport(client, input, importOpts{
+		Data:                importData,
+		UseTUI:              !plain,
+		BulkSchema:          bulkSchema,
+		StripAccountability: stripAcc,
+	})
 }
 
-func executeImport(client *apiClient, inputFile string, importData, useTUI bool) error {
+// importOpts groups per-import toggles. Easier to extend than a positional
+// argument list as more flags accrete (and at this point they will).
+type importOpts struct {
+	Data                bool
+	UseTUI              bool
+	BulkSchema          bool
+	StripAccountability bool
+}
+
+func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 	fmt.Println("Reading archive:", inputFile)
 	manifest, schema, data, systemData, err := extractArchive(inputFile)
 	if err != nil {
@@ -55,13 +73,13 @@ func executeImport(client *apiClient, inputFile string, importData, useTUI bool)
 	tracker := newTracker()
 	logFn := func(msg string) {
 		tracker.log(msg)
-		if !useTUI {
+		if !opts.UseTUI {
 			fmt.Println("  " + msg)
 		}
 	}
 
 	var program *tea.Program
-	if useTUI {
+	if opts.UseTUI {
 		m := newProgressModel(tracker)
 		program = tea.NewProgram(m, tea.WithAltScreen())
 		go func() {
@@ -78,9 +96,14 @@ func executeImport(client *apiClient, inputFile string, importData, useTUI bool)
 		}
 	}
 
-	// Count total steps for progress bar.
-	steps := 3 // schema: collections + fields + relations
-	if importData && len(data) > 0 {
+	// Count total steps for progress bar. Bulk schema collapses the three
+	// per-phase steps (collections + fields + relations) into one.
+	schemaSteps := 3
+	if opts.BulkSchema {
+		schemaSteps = 1
+	}
+	steps := schemaSteps
+	if opts.Data && len(data) > 0 {
 		steps++ // data insertion
 	}
 	for _, name := range systemImportOrder {
@@ -90,28 +113,30 @@ func executeImport(client *apiClient, inputFile string, importData, useTUI bool)
 	}
 	tracker.setTotal(steps)
 
-	tracker.setPhase("Creating collections")
-	if err := createCollections(client, schema.Collections, schema.Fields, logFn); err != nil {
-		killTUI()
-		return err
+	if opts.StripAccountability {
+		n := stripAccountability(&schema)
+		logFn(fmt.Sprintf("Stripped accountability from %d collections (no audit log on import)", n))
 	}
-	tracker.advance()
 
-	tracker.setPhase("Creating fields")
-	if err := createFields(client, schema.Fields, logFn); err != nil {
-		killTUI()
-		return err
+	if opts.BulkSchema {
+		tracker.setPhase("Applying schema (bulk)")
+		if err := schemaApplyBulk(client, schema, logFn); err != nil {
+			logFn(fmt.Sprintf("WARN: bulk schema failed (%v) — falling back to per-field", err))
+			if err := runPerFieldSchema(client, schema, tracker, logFn); err != nil {
+				killTUI()
+				return err
+			}
+		} else {
+			tracker.advance()
+		}
+	} else {
+		if err := runPerFieldSchema(client, schema, tracker, logFn); err != nil {
+			killTUI()
+			return err
+		}
 	}
-	tracker.advance()
 
-	tracker.setPhase("Creating relations")
-	if err := createRelations(client, schema.Relations, logFn); err != nil {
-		killTUI()
-		return err
-	}
-	tracker.advance()
-
-	if importData && len(data) > 0 {
+	if opts.Data && len(data) > 0 {
 		tracker.setPhase("Inserting data")
 		aliasFields := buildAliasFields(schema.Fields)
 		insertOrder := buildInsertOrder(manifest.Collections, schema.Relations)
@@ -141,10 +166,34 @@ func executeImport(client *apiClient, inputFile string, importData, useTUI bool)
 	tracker.setPhase("Complete")
 	killTUI()
 
-	if !useTUI {
+	if !opts.UseTUI {
 		fmt.Printf("\n%s Import complete\n", okStyle.Render("✓"))
 	}
 
+	return nil
+}
+
+// runPerFieldSchema runs the legacy per-field schema path: createCollections,
+// createFields, createRelations. Used as fallback when /schema/apply fails
+// (e.g. payload limit, version mismatch) or when --bulk-schema=false.
+func runPerFieldSchema(client *apiClient, schema SchemaBundle, tracker *progressTracker, logFn func(string)) error {
+	tracker.setPhase("Creating collections")
+	if err := createCollections(client, schema.Collections, schema.Fields, logFn); err != nil {
+		return err
+	}
+	tracker.advance()
+
+	tracker.setPhase("Creating fields")
+	if err := createFields(client, schema.Fields, logFn); err != nil {
+		return err
+	}
+	tracker.advance()
+
+	tracker.setPhase("Creating relations")
+	if err := createRelations(client, schema.Relations, logFn); err != nil {
+		return err
+	}
+	tracker.advance()
 	return nil
 }
 

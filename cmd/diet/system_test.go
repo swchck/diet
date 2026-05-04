@@ -2,7 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestExtractID_StringUUID(t *testing.T) {
@@ -177,6 +182,75 @@ func TestStripSensitiveFields_NonUsers(t *testing.T) {
 	json.Unmarshal(result, &obj)
 	if _, ok := obj["password"]; !ok {
 		t.Error("password should NOT be stripped from non-user entities")
+	}
+}
+
+func TestInsertSystemItems_ParallelCounts(t *testing.T) {
+	var (
+		reqCount atomic.Int64
+		peak     atomic.Int64
+		inFlight atomic.Int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		for {
+			cur := peak.Load()
+			if now <= cur || peak.CompareAndSwap(cur, now) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+
+		idx := reqCount.Add(1)
+		// Hold in-flight long enough for goroutines to overlap.
+		time.Sleep(10 * time.Millisecond)
+		// Simulate ~25% failures to verify the failed counter.
+		if idx%4 == 0 {
+			w.WriteHeader(400)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	c.Concurrency = 4
+
+	items := make([]json.RawMessage, 20)
+	for i := range items {
+		items[i] = json.RawMessage(fmt.Sprintf(`{"id":%d}`, i))
+	}
+
+	inserted, failed := insertSystemItems(c, "/flows", items)
+	if inserted+failed != 20 {
+		t.Errorf("inserted+failed = %d, want 20", inserted+failed)
+	}
+	// Server fails every 4th — exactly 5 of 20.
+	if failed != 5 {
+		t.Errorf("failed = %d, want 5", failed)
+	}
+	if inserted != 15 {
+		t.Errorf("inserted = %d, want 15", inserted)
+	}
+	if peak.Load() < 2 {
+		t.Errorf("peak in-flight = %d, expected real parallelism", peak.Load())
+	}
+	if peak.Load() > int64(c.Concurrency) {
+		t.Errorf("peak in-flight = %d, want <= %d", peak.Load(), c.Concurrency)
+	}
+}
+
+func TestInsertSystemItems_EmptyInput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("server should not be hit on empty input")
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	inserted, failed := insertSystemItems(c, "/flows", nil)
+	if inserted != 0 || failed != 0 {
+		t.Errorf("inserted=%d failed=%d, want 0/0", inserted, failed)
 	}
 }
 

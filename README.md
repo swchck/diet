@@ -1,12 +1,17 @@
 # diet — Directus Import Export Tool
 
+[![ci](https://github.com/swchck/diet/actions/workflows/ci.yml/badge.svg)](https://github.com/swchck/diet/actions/workflows/ci.yml)
+
 Full-fidelity export and import of Directus collections with all metadata, validation rules, interface options, display settings, field sort order, and relations. API-only — no database connection required.
 
 ## Features
 
 - **Full metadata preservation** — field notes, validation rules, interface options, O2M table layout, display settings, sort order
 - **System entities** — export/import flows, operations, dashboards, panels, roles, presets, translations, webhooks
-- **Interactive TUI** — collection picker with search, tabs (Collections | System), per-item selection
+- **Bulk schema apply** — uses Directus `/schema/diff` + `/schema/apply` for ~30× faster schema phase, with automatic fallback to per-field POSTs
+- **Parallel data import** — concurrent chunk POSTs inside each collection while preserving FK-safe topological order
+- **Optional audit-log skip** — `--strip-accountability` cuts data import time roughly in half by setting `meta.accountability=null` on collections
+- **Interactive TUI** — collection picker with search, tabs (Collections | System), per-item selection; per-import options screen
 - **Profile wizard** — `diet` (no args) launches a profile picker; servers persist to `~/.config/diet/config.yml`
 - **Diff** — side-by-side compare of two instances (collections, fields, relations, system counts)
 - **Clean command** — delete collections and system entities with confirmation
@@ -60,6 +65,10 @@ diet import -i backup.tar.zst --target-url=... --target-token=... \
 
 # Skip data, import schema only
 diet import -i backup.tar.zst --target-url=... --target-token=... --data=false
+
+# Fastest path: skip audit log + crank concurrency
+diet --concurrency=24 --batch-size=200 import -i backup.tar.zst \
+  --target-url=... --target-token=... --strip-accountability
 ```
 
 ### Clean
@@ -90,8 +99,20 @@ diet diff
 | `--url` | Directus instance URL |
 | `--token` | Static access token |
 | `--plain` | Plain text output for scripting (no TUI) |
+| `--concurrency` | Parallel HTTP workers (default 6) |
+| `--timeout` | HTTP timeout in seconds (default 60) |
+| `--batch-size` | Items per batch POST during data import (default 100) |
+| `--retry-passes` | Max retry passes for FK-blocked rows (default 5) |
 
-Per-profile tuning (set in `~/.config/diet/config.yml` via the wizard):
+`import`-specific flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bulk-schema` | `true` | Use Directus `/schema/apply` for the schema phase (~30× faster). On any error — payload too large, version mismatch — falls back to the per-field path automatically. |
+| `--strip-accountability` | `false` | Set `meta.accountability=null` on every imported collection. Skips `directus_activity` (audit log) and `directus_revisions` writes during data import — roughly halves the data-phase time on Directus's side. Reversible after import via the admin UI (collection settings → Activity & Revisions Tracking). |
+| `--data` | `true` | Also import item data. Set `--data=false` for schema-only. |
+
+The same tuning fields are persisted per-profile in `~/.config/diet/config.yml` via the wizard:
 
 | Field | Default | Effect |
 |-------|---------|--------|
@@ -100,6 +121,31 @@ Per-profile tuning (set in `~/.config/diet/config.yml` via the wizard):
 | `batch_size` | 100 | Items per batch POST during import |
 | `retry_passes` | 5 | Max retry passes for FK-blocked rows |
 | `format` | `zstd` | Archive format (`zstd` or `zip`) |
+
+## Performance
+
+On a real-world archive (119 collections, 858 fields, 158k items, 1.5MB compressed) against a single-node Dockerized Directus:
+
+| Settings | Time |
+|----------|-----:|
+| `--bulk-schema=false` (legacy per-field path) | ~2m 30s |
+| Default (`--bulk-schema=true`) | ~1m 30s |
+| `--concurrency=24 --batch-size=200` | ~1m 25s |
+| `+ --strip-accountability` | ~35s |
+
+The biggest single lever is `--strip-accountability`. The remaining floor is Directus itself — its Node process saturates one CPU core handling validation, ACL, and schema cache lookups per row. Past `--concurrency=12` returns flatten because Directus is the bottleneck, not the diet client.
+
+### Target Directus requirements
+
+`--bulk-schema=true` posts the entire snapshot as a single request. The default Directus `MAX_PAYLOAD_SIZE=1mb` rejects real-world archives — set it to `10mb` or higher on the target:
+
+```yaml
+# docker-compose.yml on the target
+environment:
+  MAX_PAYLOAD_SIZE: "10mb"
+```
+
+If that's not feasible, pass `--bulk-schema=false` and diet falls back to per-field POSTs (slower, but no payload-size requirement).
 
 ## Archive Format
 
@@ -130,13 +176,21 @@ docker compose down -v          # Clean reset
 
 Local Directus runs at `http://localhost:8055` with credentials `admin@example.com` / `admin` and static token `e2e-test-token`.
 
+The bundled `docker-compose.yml` is tuned for fast local imports — not a production recipe. Notable env vars set on the Directus service:
+
+- `MAX_PAYLOAD_SIZE=10mb` — required by `--bulk-schema`
+- `LOG_LEVEL=error` — keeps real failures visible, drops the per-request info noise
+- `RATE_LIMITER_ENABLED=false`, `PRESSURE_LIMITER_ENABLED=false` — the pressure limiter would otherwise 503 us when Directus saturates CPU under bulk import
+- `WEBSOCKETS_ENABLED=false`, `OPENAPI_ENABLED=false`, `GRAPHQL_INTROSPECTION=false`, `TELEMETRY=false` — drop unused surface
+- `ACCEPT_TERMS=true` — pre-acks the BSL banner in the admin UI
+
 ```bash
-# Build and test against local instance
+# Build and smoke against local instance
 go build -o bin/diet ./cmd/diet
 ./bin/diet export --url=http://localhost:8055 --token=e2e-test-token --all --plain
 
-# Run tests
-go test ./cmd/diet/ -v
+# Run tests (CI runs the same with -race)
+go test -race -count=1 ./...
 ```
 
 ## Known Limitations

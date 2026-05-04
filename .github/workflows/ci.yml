@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Newer push to the same branch/PR cancels in-flight runs — saves CI minutes
+# on rapid-fire commits during a perf pass.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # go-version-file pins to whatever go.mod declares — single source of
+      # truth, no drift between local toolchain and CI.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # -race catches the kinds of bugs runParallel and the chunk-fan-out in
+      # batchInsert could regress into. Worth the ~2× slowdown.
+      - name: go test (race)
+        run: go test -race -count=1 ./...

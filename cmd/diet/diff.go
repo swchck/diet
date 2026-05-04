@@ -87,8 +87,9 @@ func runDiff(cmd *cobra.Command, args []string) error {
 
 	// If all flags provided, run directly.
 	if sourceURL != "" && sourceToken != "" && targetURL != "" && targetToken != "" {
-		source := newClient(sourceURL, sourceToken)
-		target := newClient(targetURL, targetToken)
+		opts := clientOptionsFromFlags(cmd)
+		source := newClientWithOptions(sourceURL, sourceToken, opts)
+		target := newClientWithOptions(targetURL, targetToken, opts)
 		if plain {
 			return runSimpleDiff(source, target, sourceURL, targetURL)
 		}
