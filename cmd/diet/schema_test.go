@@ -2,7 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBuildInsertOrder_LinearChain(t *testing.T) {
@@ -153,6 +160,186 @@ func TestIsPrimaryKey(t *testing.T) {
 	}
 	if isPrimaryKey(noSchema) {
 		t.Error("expected isPrimaryKey to return false for null schema")
+	}
+}
+
+// TestCreateFields_Parallel verifies that:
+//   - PK fields are skipped (not POSTed),
+//   - non-PK fields are all POSTed exactly once,
+//   - the reorder PATCH pass runs only for fields with explicit meta.sort,
+//   - the call respects client.Concurrency.
+func TestCreateFields_Parallel(t *testing.T) {
+	var (
+		postCount atomic.Int64
+		patchCount atomic.Int64
+		inFlight   atomic.Int64
+		peak       atomic.Int64
+		mu         sync.Mutex
+		postedFields = map[string]bool{}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		for {
+			cur := peak.Load()
+			if now <= cur || peak.CompareAndSwap(cur, now) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+
+		switch r.Method {
+		case "POST":
+			postCount.Add(1)
+			// /fields/<col>
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			if len(parts) != 2 || parts[0] != "fields" {
+				t.Errorf("unexpected POST path: %s", r.URL.Path)
+			}
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			fname, _ := body["field"].(string)
+			mu.Lock()
+			postedFields[parts[1]+"."+fname] = true
+			mu.Unlock()
+			w.WriteHeader(200)
+			w.Write([]byte(`{}`))
+		case "PATCH":
+			patchCount.Add(1)
+			w.WriteHeader(200)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	c.Concurrency = 4
+
+	fields := []FieldInfo{
+		// PK on posts — must be skipped.
+		{Collection: "posts", Field: "id", Type: "integer",
+			Schema: json.RawMessage(`{"is_primary_key":true}`),
+			Meta:   json.RawMessage(`{"sort":1}`)},
+		{Collection: "posts", Field: "title", Type: "string",
+			Schema: json.RawMessage(`{}`),
+			Meta:   json.RawMessage(`{"sort":2}`)},
+		{Collection: "posts", Field: "tags", Type: "alias",
+			Meta: json.RawMessage(`{"sort":3}`)},
+		// Field without explicit sort — should NOT be PATCHed.
+		{Collection: "users", Field: "email", Type: "string",
+			Schema: json.RawMessage(`{}`),
+			Meta:   json.RawMessage(`{}`)},
+		{Collection: "users", Field: "name", Type: "string",
+			Schema: json.RawMessage(`{}`),
+			Meta:   json.RawMessage(`{"sort":1}`)},
+	}
+
+	if err := createFields(c, fields, func(string) {}); err != nil {
+		t.Fatalf("createFields: %v", err)
+	}
+
+	if postCount.Load() != 4 {
+		t.Errorf("POST count = %d, want 4 (PK skipped)", postCount.Load())
+	}
+	if !postedFields["posts.title"] || !postedFields["posts.tags"] ||
+		!postedFields["users.email"] || !postedFields["users.name"] {
+		t.Errorf("missing expected fields: %v", postedFields)
+	}
+	if postedFields["posts.id"] {
+		t.Error("PK field posts.id should be skipped")
+	}
+	if patchCount.Load() != 3 {
+		t.Errorf("PATCH count = %d, want 3 (only fields with explicit sort)", patchCount.Load())
+	}
+	if peak.Load() < 2 {
+		t.Errorf("peak in-flight = %d, expected real parallelism", peak.Load())
+	}
+	if peak.Load() > int64(c.Concurrency) {
+		t.Errorf("peak in-flight = %d, want <= %d", peak.Load(), c.Concurrency)
+	}
+}
+
+func TestCreateFields_TransportErrorReturns(t *testing.T) {
+	// Server immediately closes connection — every POST returns a transport
+	// error. createFields should surface the first one.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("hijack not supported")
+		}
+		conn, _, _ := hj.Hijack()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	c.Concurrency = 2
+
+	fields := []FieldInfo{
+		{Collection: "x", Field: "a", Type: "string", Schema: json.RawMessage(`{}`), Meta: json.RawMessage(`{}`)},
+		{Collection: "x", Field: "b", Type: "string", Schema: json.RawMessage(`{}`), Meta: json.RawMessage(`{}`)},
+	}
+	err := createFields(c, fields, func(string) {})
+	if err == nil {
+		t.Fatal("expected error on transport failure")
+	}
+	if !strings.Contains(err.Error(), "create field") {
+		t.Errorf("err = %v, want it to mention 'create field'", err)
+	}
+}
+
+func TestCreateRelations_Parallel(t *testing.T) {
+	var (
+		postCount atomic.Int64
+		peak      atomic.Int64
+		inFlight  atomic.Int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		for {
+			cur := peak.Load()
+			if now <= cur || peak.CompareAndSwap(cur, now) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+
+		if r.Method != "POST" || r.URL.Path != "/relations" {
+			t.Errorf("unexpected req: %s %s", r.Method, r.URL.Path)
+		}
+		postCount.Add(1)
+		// Hold in-flight long enough for goroutines to overlap.
+		time.Sleep(10 * time.Millisecond)
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	c.Concurrency = 3
+
+	relations := make([]RelationInfo, 12)
+	for i := range relations {
+		relations[i] = RelationInfo{
+			Collection:        "posts",
+			Field:             fmt.Sprintf("rel_%d", i),
+			RelatedCollection: "users",
+			Schema:            json.RawMessage(`{}`),
+			Meta:              json.RawMessage(`{}`),
+		}
+	}
+
+	if err := createRelations(c, relations, func(string) {}); err != nil {
+		t.Fatalf("createRelations: %v", err)
+	}
+	if postCount.Load() != 12 {
+		t.Errorf("POST count = %d, want 12", postCount.Load())
+	}
+	if peak.Load() < 2 {
+		t.Errorf("peak in-flight = %d, expected real parallelism", peak.Load())
+	}
+	if peak.Load() > int64(c.Concurrency) {
+		t.Errorf("peak in-flight = %d, want <= %d", peak.Load(), c.Concurrency)
 	}
 }
 

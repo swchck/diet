@@ -26,6 +26,15 @@ type dataProgress struct {
 // inserts to isolate which rows are blocked. Whatever still fails is deferred
 // to the next pass, by which time the row it was waiting on may exist.
 // After RetryPasses, anything left is counted as permanently failed.
+//
+// Ordering: collections are processed sequentially in `order` (FK-safe topo
+// sort). Parallelism lives INSIDE each collection — chunks fan out across
+// `Concurrency` workers. We tried flattening (collection, chunk) into one
+// global queue; the gain on huge tables was real, but chunks of a child
+// collection ran ahead of the parent collection's last chunks, blowing up
+// FK conflicts and pushing twice as much work into pass 2. Sequential
+// collections keep that ordering intact while still saturating the workers
+// for any collection big enough to matter.
 func applyData(client *apiClient, order []string, dataMap map[string][]json.RawMessage,
 	aliasFields map[string]map[string]bool, log func(string)) *dataProgress {
 	progress := &dataProgress{}
@@ -33,7 +42,7 @@ func applyData(client *apiClient, order []string, dataMap map[string][]json.RawM
 		progress.total += len(items)
 	}
 
-	// Prepare items: strip alias fields.
+	// Prepare items per-collection: strip alias fields, fix datetimes.
 	type colData struct {
 		name  string
 		items []json.RawMessage
@@ -54,50 +63,27 @@ func applyData(client *apiClient, order []string, dataMap map[string][]json.RawM
 	}
 
 	maxPasses := client.RetryPasses
-	sem := make(chan struct{}, client.Concurrency)
 
 	for pass := 1; pass <= maxPasses; pass++ {
 		progress.pass = pass
 		passInserted := 0
 		passRemaining := 0
 
-		type result struct {
-			idx      int
-			inserted int
-			failed   []json.RawMessage
-		}
-		results := make(chan result, len(allData))
-		active := 0
-
+		// Walk collections in topological order. Within each collection,
+		// batchInsert fans out chunks in parallel.
 		for i := range allData {
 			cd := &allData[i]
 			if len(cd.items) == 0 {
 				continue
 			}
-			active++
-			idx := i
-			items := cd.items
-			name := cd.name
+			ins, failed := batchInsert(client, cd.name, cd.items)
+			progress.inserted.Add(int64(ins))
+			passInserted += ins
 
-			go func() {
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				ins, failed := batchInsert(client, name, items)
-				progress.inserted.Add(int64(ins))
-				results <- result{idx: idx, inserted: ins, failed: failed}
-			}()
-		}
-
-		for range active {
-			r := <-results
-			cd := &allData[r.idx]
-			passInserted += r.inserted
-
-			if len(r.failed) > 0 {
-				cd.items = r.failed
+			if len(failed) > 0 {
+				cd.items = failed
 				if pass < maxPasses {
-					passRemaining += len(r.failed)
+					passRemaining += len(failed)
 				}
 			} else {
 				cd.items = nil
@@ -111,7 +97,6 @@ func applyData(client *apiClient, order []string, dataMap map[string][]json.RawM
 		}
 	}
 
-	// Count items that remain after all passes as failed.
 	for _, cd := range allData {
 		progress.failed.Add(int64(len(cd.items)))
 	}
@@ -119,40 +104,76 @@ func applyData(client *apiClient, order []string, dataMap map[string][]json.RawM
 	return progress
 }
 
+// batchInsert POSTs items for one collection in parallel chunks.
+//
+// Why fan out within a collection: a 50k-item translations table at
+// chunkSize=100 is 500 sequential POSTs. Even at 50ms per round-trip that's
+// 25 seconds for one collection while the other workers idle. Splitting
+// chunks across `Concurrency` workers reclaims that idle time.
+//
+// Why fan out is safe: rows inside a single Directus collection have no
+// inter-row constraints we care about — each item has its own PK and any
+// FK references either point at other (already-inserted) collections or
+// loop back to the same collection but always to existing rows. Order
+// within a chunk doesn't matter; order across chunks doesn't matter.
 func batchInsert(client *apiClient, collection string, items []json.RawMessage) (int, []json.RawMessage) {
-	inserted := 0
-	var retryable []json.RawMessage
-
-	path := "/items/" + url.PathEscape(collection)
 	chunkSize := client.BatchSize
+	if chunkSize < 1 {
+		chunkSize = 100
+	}
 
+	// Slice into chunks up front so each runParallel job is independent.
+	var chunks [][]json.RawMessage
 	for i := 0; i < len(items); i += chunkSize {
 		end := min(i+chunkSize, len(items))
-		chunk := items[i:end]
+		chunks = append(chunks, items[i:end])
+	}
 
-		// Try the whole chunk in one POST. Directus rejects atomically on the
-		// first FK violation, so on failure we retry one-by-one to isolate the
-		// rows that are still blocked vs the rows that just got unlucky.
-		batchData, _ := json.Marshal(chunk)
-		_, status, _ := client.post(path, batchData)
-		if status >= 200 && status < 300 {
-			inserted += len(chunk)
-			continue
+	var inserted atomic.Int64
+	var retryMu sync.Mutex
+	var retryable []json.RawMessage
+
+	_ = runParallel(client, chunks, func(chunk []json.RawMessage) error {
+		ins, fail := postChunk(client, collection, chunk)
+		inserted.Add(int64(ins))
+		if len(fail) > 0 {
+			retryMu.Lock()
+			retryable = append(retryable, fail...)
+			retryMu.Unlock()
 		}
+		return nil
+	})
+	return int(inserted.Load()), retryable
+}
 
-		// Per-item fallback. Items that still fail go back to the caller for
-		// the next pass. "Already exists" responses count as success — they
-		// happen when an earlier pass partially succeeded before a batch error.
-		for _, item := range chunk {
-			respBody, st, _ := client.post(path, item)
-			switch {
-			case st >= 200 && st < 300:
-				inserted++
-			case isAlreadyExists(string(respBody)):
-				inserted++
-			default:
-				retryable = append(retryable, item)
-			}
+// postChunk POSTs one batch of items to /items/<collection>. On a successful
+// batch we're done. On any 4xx/5xx we retry items one-by-one to isolate the
+// row(s) that are still blocked from the rows that just got rolled back
+// alongside them — Directus batch inserts are atomic, so a single bad FK
+// kills an otherwise-clean chunk.
+func postChunk(client *apiClient, collection string, items []json.RawMessage) (int, []json.RawMessage) {
+	path := "/items/" + url.PathEscape(collection)
+
+	batchData, _ := json.Marshal(items)
+	_, status, _ := client.post(path, batchData)
+	if status >= 200 && status < 300 {
+		return len(items), nil
+	}
+
+	// Per-item fallback. "Already exists" counts as success — it happens
+	// when an earlier pass partially landed before a batch error rolled back
+	// only the trailing rows.
+	inserted := 0
+	var retryable []json.RawMessage
+	for _, item := range items {
+		respBody, st, _ := client.post(path, item)
+		switch {
+		case st >= 200 && st < 300:
+			inserted++
+		case isAlreadyExists(string(respBody)):
+			inserted++
+		default:
+			retryable = append(retryable, item)
 		}
 	}
 	return inserted, retryable

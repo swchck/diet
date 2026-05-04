@@ -765,7 +765,7 @@ func runWizard() error {
 
 	case "import":
 		client := newClientWithOptions(res.targetProf.URL, res.targetProf.Token, res.targetProf.clientOptions())
-		if err := executeImport(client, res.inputFile, true, true); err != nil {
+		if err := executeImport(client, res.inputFile, true, true, true); err != nil {
 			return err
 		}
 

@@ -33,7 +33,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--url and --token are required")
 	}
 
-	client := newClient(url, token)
+	client := newClientWithOptions(url, token, clientOptionsFromFlags(cmd))
 
 	if plain || all {
 		return runSimpleExport(client, url, output, format, all)

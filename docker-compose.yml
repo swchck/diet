@@ -43,6 +43,10 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       WEBSOCKETS_ENABLED: "true"
+      MAX_PAYLOAD_SIZE: "10mb"
+      DB_POOL_MAX: "40"
+      LOGGER_LEVEL: "warn"
+      CACHE_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy

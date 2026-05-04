@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 )
 
 // System entity types (flows, dashboards, etc.)
@@ -88,16 +89,17 @@ func countSystemItems(client *apiClient, endpoint string) int {
 // Insert (import)
 
 func insertSystemItems(client *apiClient, endpoint string, items []json.RawMessage) (int, int) {
-	inserted, failed := 0, 0
-	for _, item := range items {
+	var inserted, failed atomic.Int64
+	_ = runParallel(client, items, func(item json.RawMessage) error {
 		_, status, _ := client.post(endpoint, item)
 		if status >= 200 && status < 300 {
-			inserted++
+			inserted.Add(1)
 		} else {
-			failed++
+			failed.Add(1)
 		}
-	}
-	return inserted, failed
+		return nil
+	})
+	return int(inserted.Load()), int(failed.Load())
 }
 
 // Delete (clean)

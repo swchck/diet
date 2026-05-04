@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 // apiClient is a thin Directus REST client with token-refresh support.
@@ -39,6 +41,23 @@ type clientOptions struct {
 
 func newClient(baseURL, token string) *apiClient {
 	return newClientWithOptions(baseURL, token, clientOptions{})
+}
+
+// clientOptionsFromFlags builds clientOptions from the persistent root
+// flags (--concurrency, --timeout, --batch-size, --retry-passes). Zero
+// flag values are preserved as zero so newClientWithOptions falls back to
+// package defaults.
+func clientOptionsFromFlags(cmd *cobra.Command) clientOptions {
+	concurrency, _ := cmd.Flags().GetInt("concurrency")
+	timeout, _ := cmd.Flags().GetInt("timeout")
+	batchSize, _ := cmd.Flags().GetInt("batch-size")
+	retryPasses, _ := cmd.Flags().GetInt("retry-passes")
+	return clientOptions{
+		Concurrency: concurrency,
+		Timeout:     timeout,
+		BatchSize:   batchSize,
+		RetryPasses: retryPasses,
+	}
 }
 
 func newClientWithOptions(baseURL, token string, opts clientOptions) *apiClient {
@@ -207,6 +226,41 @@ func (c *apiClient) del(path string) (int, error) {
 // pullAllItems fetches all items with offset-based pagination.
 func (c *apiClient) pullAllItems(collection string) ([]json.RawMessage, error) {
 	return c.pullPaginated("/items/" + url.PathEscape(collection))
+}
+
+// runParallel executes fn concurrently across items, capped at
+// client.Concurrency in-flight calls. Waits for every goroutine to finish
+// and returns the first non-nil error any worker produced (others still
+// run to completion — Directus calls aren't cheaply cancellable, and
+// stopping early would leave the schema half-built).
+func runParallel[T any](client *apiClient, items []T, fn func(T) error) error {
+	if len(items) == 0 {
+		return nil
+	}
+	concurrency := max(client.Concurrency, 1)
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var (
+		errMu    sync.Mutex
+		firstErr error
+	)
+	for _, item := range items {
+		wg.Add(1)
+		go func(item T) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := fn(item); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}(item)
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // pullPaginated fetches all items from a paginated endpoint. On mid-stream
