@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -22,6 +23,7 @@ func newImportCmd() *cobra.Command {
 	cmd.Flags().Bool("data", true, "Also import item data")
 	cmd.Flags().Bool("bulk-schema", true, "Use Directus /schema/apply for schema (10-40× faster). Falls back to per-field on error.")
 	cmd.Flags().Bool("strip-accountability", false, "Set meta.accountability=null on imported collections (skip activity + revisions logging — ~2-3× faster data import)")
+	cmd.Flags().String("db-dsn", "", "Postgres DSN for direct COPY-protocol data load, bypassing the Directus REST API (e.g. postgres://user:pass@host:5432/db?sslmode=disable). Schema still goes through Directus. UNSAFE: skips ACL/hooks/cache — local/CI/manual pipelines only.")
 	_ = cmd.MarkFlagRequired("input")
 	_ = cmd.MarkFlagRequired("target-url")
 	_ = cmd.MarkFlagRequired("target-token")
@@ -37,6 +39,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	importData, _ := cmd.Flags().GetBool("data")
 	bulkSchema, _ := cmd.Flags().GetBool("bulk-schema")
 	stripAcc, _ := cmd.Flags().GetBool("strip-accountability")
+	dbDSN, _ := cmd.Flags().GetString("db-dsn")
 	plain, _ := cmd.Flags().GetBool("plain")
 
 	client := newClientWithOptions(targetURL, targetToken, clientOptionsFromFlags(cmd))
@@ -48,6 +51,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		UseTUI:              !plain,
 		BulkSchema:          bulkSchema,
 		StripAccountability: stripAcc,
+		DBDSN:               dbDSN,
 	})
 }
 
@@ -58,6 +62,11 @@ type importOpts struct {
 	UseTUI              bool
 	BulkSchema          bool
 	StripAccountability bool
+	// DBDSN, when non-empty, switches the data-import phase to a
+	// direct-to-Postgres COPY load instead of the REST /items/<col>
+	// path. Schema still goes through Directus. CLI-only — never set
+	// from the wizard.
+	DBDSN string
 }
 
 func executeImport(client *apiClient, inputFile string, opts importOpts) error {
@@ -137,10 +146,36 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 	}
 
 	if opts.Data && len(data) > 0 {
-		tracker.setPhase("Inserting data")
 		aliasFields := buildAliasFields(schema.Fields)
 		insertOrder := buildInsertOrder(manifest.Collections, schema.Relations)
-		progress := applyData(client, insertOrder, data, aliasFields, logFn)
+
+		var progress *dataProgress
+		if opts.DBDSN != "" {
+			tracker.setPhase("Inserting data (direct DB)")
+			logFn("Direct-DB mode: bypassing Directus REST for item inserts")
+			p, err := applyDataDirect(
+				context.Background(),
+				opts.DBDSN,
+				insertOrder,
+				data,
+				schema.Fields,
+				aliasFields,
+				client.Concurrency,
+				client.RetryPasses,
+				logFn,
+			)
+			if err != nil {
+				logFn(fmt.Sprintf("WARN: direct-DB load failed (%v) — falling back to REST", err))
+				tracker.setPhase("Inserting data (fallback REST)")
+				progress = applyData(client, insertOrder, data, aliasFields, logFn)
+			} else {
+				progress = p
+			}
+		} else {
+			tracker.setPhase("Inserting data")
+			progress = applyData(client, insertOrder, data, aliasFields, logFn)
+		}
+
 		inserted := int(progress.inserted.Load())
 		logFn(fmt.Sprintf("Data: %d/%d items inserted", inserted, progress.total))
 		tracker.advance()
