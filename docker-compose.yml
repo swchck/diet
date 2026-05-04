@@ -45,19 +45,35 @@ services:
       # Required by diet's bulk schema apply path: snapshots run ~1.4MB
       # for a real-world archive, the default 1MB cap rejects them with 413.
       MAX_PAYLOAD_SIZE: "10mb"
-      # Dev convenience — chosen for fast local imports, not a prod recipe:
-      LOG_LEVEL: "fatal"             # silence per-request logging
-      RATE_LIMITER_ENABLED: "false"   # kill per-IP counter overhead
+
+      # Dev convenience — chosen for fast local imports, not a prod recipe.
+      LOG_LEVEL: "error" # surface errors but skip per-request info logs
+      RATE_LIMITER_ENABLED: "false" # kill per-IP counter overhead
       PRESSURE_LIMITER_ENABLED: "false" # don't 503 us when CPU saturates
-      TELEMETRY: "false"              # no anonymous pings to Directus
-      WEBSOCKETS_ENABLED: "false"     # we don't subscribe in tests
+      TELEMETRY: "false" # no anonymous pings to Directus
+      WEBSOCKETS_ENABLED: "false" # we don't subscribe in tests
+      OPENAPI_ENABLED: "false" # no /server/specs/oas, smaller startup surface
+      GRAPHQL_INTROSPECTION: "false" # don't expose schema via GraphQL
+      ACCEPT_TERMS: "true" # skip the BSL banner in the admin UI
+      # Tested: CACHE_SCHEMA=false slows bulk import by ~30% (32s → 42s on
+      # our profile) — every /items/<col> POST re-reads the schema. Leave
+      # the default true.
+      # Default already excludes PostGIS spatial_ref_sys + sysdiagrams (MSSQL).
+      # Listed here explicitly so it's obvious — anything else PostGIS-y
+      # (geometry_columns, geography_columns, raster_*) is a view and
+      # already invisible to Directus's collection introspection.
+      DB_EXCLUDE_TABLES: "spatial_ref_sys,sysdiagrams"
+      # Uncomment to drop the Data Studio bundle (saves RAM if you only
+      # talk to the API and never open /admin):
+      # SERVE_APP: "false"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8055/server/health || exit 1"]
+      test:
+        ["CMD-SHELL", "wget -qO- http://localhost:8055/server/health || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 20
