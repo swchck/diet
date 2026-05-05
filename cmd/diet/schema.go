@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -88,6 +89,94 @@ func fetchRelations(client *apiClient) ([]RelationInfo, error) {
 		return nil, err
 	}
 	return resp.Data, nil
+}
+
+// fetchSystemCustomFields collects user-added (non-system) fields on
+// directus_* collections that are referenced by relations involving any of
+// the user collections we're exporting.
+//
+// Why this exists: fetchCollections strips directus_* entirely, and
+// fetchAllFields only walks the user-collection list. But Directus lets you
+// add custom fields to directus_users, directus_files, etc. (e.g. an M2M
+// "game_accounts" alias on directus_users) — and our relations pull in
+// references to those custom fields. Without this, the relation lands in the
+// archive but the field that the FK points at does not, and the target
+// schema is broken.
+//
+// Built-in Directus fields (meta.system == true) are filtered out: the target
+// already has them and re-POSTing them would either error or duplicate.
+//
+// Returns only the custom fields. Caller is expected to append them to the
+// main fields slice before snapshotting / per-field creation.
+func fetchSystemCustomFields(client *apiClient, relations []RelationInfo, userColSet map[string]bool) ([]FieldInfo, error) {
+	seen := make(map[string]bool)
+	var systemCols []string
+	consider := func(side, other string) {
+		if !strings.HasPrefix(side, "directus_") {
+			return
+		}
+		if !userColSet[other] {
+			return
+		}
+		if seen[side] {
+			return
+		}
+		seen[side] = true
+		systemCols = append(systemCols, side)
+	}
+	for _, r := range relations {
+		consider(r.Collection, r.RelatedCollection)
+		consider(r.RelatedCollection, r.Collection)
+	}
+	if len(systemCols) == 0 {
+		return nil, nil
+	}
+
+	var (
+		mu     sync.Mutex
+		merged []FieldInfo
+	)
+	err := runParallel(client, systemCols, func(col string) error {
+		fields, err := fetchFields(client, col)
+		if err != nil {
+			return fmt.Errorf("fields for %s: %w", col, err)
+		}
+		var keep []FieldInfo
+		for _, f := range fields {
+			if isSystemField(f) {
+				continue
+			}
+			keep = append(keep, f)
+		}
+		mu.Lock()
+		merged = append(merged, keep...)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Stable order — tests + diff readability.
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Collection != merged[j].Collection {
+			return merged[i].Collection < merged[j].Collection
+		}
+		return merged[i].Field < merged[j].Field
+	})
+	return merged, nil
+}
+
+// isSystemField reports whether a field is a built-in Directus field
+// (meta.system == true). Custom user-added fields on system collections —
+// the only ones we want to round-trip — have meta.system absent or false.
+func isSystemField(f FieldInfo) bool {
+	var meta struct {
+		System *bool `json:"system"`
+	}
+	if err := json.Unmarshal(f.Meta, &meta); err != nil {
+		return false
+	}
+	return meta.System != nil && *meta.System
 }
 
 // countItems returns item count for a collection.

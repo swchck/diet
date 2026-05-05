@@ -24,6 +24,7 @@ func newImportCmd() *cobra.Command {
 	cmd.Flags().Bool("bulk-schema", true, "Use Directus /schema/apply for schema (10-40× faster). Falls back to per-field on error.")
 	cmd.Flags().Bool("strip-accountability", false, "Set meta.accountability=null on imported collections (skip activity + revisions logging — ~2-3× faster data import)")
 	cmd.Flags().String("db-dsn", "", "Postgres DSN for direct COPY-protocol data load, bypassing the Directus REST API (e.g. postgres://user:pass@host:5432/db?sslmode=disable). Schema still goes through Directus. UNSAFE: skips ACL/hooks/cache — local/CI/manual pipelines only.")
+	cmd.Flags().Bool("strict", false, "Exit non-zero if any data row or system entity failed to import. By default partial failures are logged but the command exits 0 (legacy behavior). CI/automation should set --strict to detect silent breakage.")
 	_ = cmd.MarkFlagRequired("input")
 	_ = cmd.MarkFlagRequired("target-url")
 	_ = cmd.MarkFlagRequired("target-token")
@@ -40,6 +41,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	bulkSchema, _ := cmd.Flags().GetBool("bulk-schema")
 	stripAcc, _ := cmd.Flags().GetBool("strip-accountability")
 	dbDSN, _ := cmd.Flags().GetString("db-dsn")
+	strict, _ := cmd.Flags().GetBool("strict")
 	plain, _ := cmd.Flags().GetBool("plain")
 
 	client := newClientWithOptions(targetURL, targetToken, clientOptionsFromFlags(cmd))
@@ -52,6 +54,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		BulkSchema:          bulkSchema,
 		StripAccountability: stripAcc,
 		DBDSN:               dbDSN,
+		Strict:              strict,
 	})
 }
 
@@ -67,6 +70,11 @@ type importOpts struct {
 	// path. Schema still goes through Directus. CLI-only — never set
 	// from the wizard.
 	DBDSN string
+	// Strict turns "logged but tolerated" partial failures into a
+	// non-zero exit. Off by default for backward compatibility — many
+	// existing pipelines treat a few FK-orphan rows as expected. CI
+	// jobs that care about exact item counts should turn it on.
+	Strict bool
 }
 
 func executeImport(client *apiClient, inputFile string, opts importOpts) error {
@@ -145,6 +153,14 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 		}
 	}
 
+	// Aggregate counters across data + system phases so we can report a
+	// single bottom-line and decide whether --strict should turn this
+	// into a non-zero exit.
+	var (
+		dataInserted, dataTotal int
+		sysInserted, sysFailed  int
+	)
+
 	if opts.Data && len(data) > 0 {
 		aliasFields := buildAliasFields(schema.Fields)
 		insertOrder := buildInsertOrder(manifest.Collections, schema.Relations)
@@ -176,8 +192,9 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 			progress = applyData(client, insertOrder, data, aliasFields, logFn)
 		}
 
-		inserted := int(progress.inserted.Load())
-		logFn(fmt.Sprintf("Data: %d/%d items inserted", inserted, progress.total))
+		dataInserted = int(progress.inserted.Load())
+		dataTotal = progress.total
+		logFn(fmt.Sprintf("Data: %d/%d items inserted", dataInserted, dataTotal))
 		tracker.advance()
 	}
 
@@ -193,6 +210,8 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 				continue
 			}
 			ins, fail := insertSystemItems(client, entity.Endpoint, items)
+			sysInserted += ins
+			sysFailed += fail
 			logFn(fmt.Sprintf("System %s: %d inserted, %d failed", name, ins, fail))
 			tracker.advance()
 		}
@@ -205,6 +224,31 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 		fmt.Printf("\n%s Import complete\n", okStyle.Render("✓"))
 	}
 
+	return classifyImportOutcome(opts.Strict, dataInserted, dataTotal, sysInserted, sysFailed)
+}
+
+// classifyImportOutcome turns the aggregate counters into either nil
+// (success), a hard error (catastrophic — nothing landed when something
+// should have), or a strict-mode error (any partial loss when --strict
+// is set). Pulled out so it's straightforward to unit test the policy
+// independently from the import driver.
+func classifyImportOutcome(strict bool, dataInserted, dataTotal, sysInserted, sysFailed int) error {
+	dataLoss := dataTotal - dataInserted
+
+	// Catastrophic — we tried to import data and 0 of N landed. No
+	// reasonable caller wants exit 0 here regardless of --strict.
+	if dataTotal > 0 && dataInserted == 0 {
+		return fmt.Errorf("import failed: 0 of %d data items inserted (target unreachable, FK chain broken, or schema mismatch)", dataTotal)
+	}
+
+	if !strict {
+		return nil
+	}
+
+	if dataLoss > 0 || sysFailed > 0 {
+		return fmt.Errorf("strict mode: %d/%d data items lost, %d system items failed (set --strict=false to ignore partial failures)",
+			dataLoss, dataTotal, sysFailed)
+	}
 	return nil
 }
 

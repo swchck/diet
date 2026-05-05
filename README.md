@@ -8,6 +8,7 @@ Full-fidelity export and import of Directus collections with all metadata, valid
 
 - **Full metadata preservation** — field notes, validation rules, interface options, O2M table layout, display settings, sort order
 - **System entities** — export/import flows, operations, dashboards, panels, roles, presets, translations, webhooks
+- **Custom fields on system collections** — fields you've added to `directus_users` / `directus_files` / etc. (e.g. an M2M alias on `directus_users` pointing at one of your collections) are detected via relations and round-tripped automatically; built-in fields are skipped
 - **Bulk schema apply** — uses Directus `/schema/diff` + `/schema/apply` for ~30× faster schema phase, with automatic fallback to per-field POSTs
 - **Parallel data import** — concurrent chunk POSTs inside each collection while preserving FK-safe topological order
 - **Optional audit-log skip** — `--strip-accountability` cuts data import time roughly in half by setting `meta.accountability=null` on collections
@@ -48,6 +49,10 @@ diet export --url=https://directus.example.com --token=YOUR_TOKEN
 
 # Export all collections without TUI
 diet export --url=https://directus.example.com --token=YOUR_TOKEN --all
+
+# Export collections AND every system entity (flows, dashboards, roles,
+# users, translations, webhooks + their dependents). Mirrors the TUI default.
+diet export --url=... --token=... --all --system
 
 # Custom output path and format
 diet export --url=... --token=... -o backup.zip --format=zip
@@ -112,6 +117,7 @@ diet diff
 | `--strip-accountability` | `false` | Set `meta.accountability=null` on every imported collection. Skips `directus_activity` (audit log) and `directus_revisions` writes during data import — roughly halves the data-phase time on Directus's side. Reversible after import via the admin UI (collection settings → Activity & Revisions Tracking). |
 | `--db-dsn` | `""` | **UNSAFE — local/CI/manual pipelines only.** Postgres DSN. When set, items are loaded straight into Postgres via the `COPY` protocol, bypassing the Directus REST API. Schema still goes through Directus. Skips ACL, hooks, cache invalidation. ~4× faster than the REST path. On connection or COPY failure, falls back to REST automatically with a warning. |
 | `--data` | `true` | Also import item data. Set `--data=false` for schema-only. |
+| `--strict` | `false` | Exit non-zero on any partial failure (data items lost, system entities failed). Off by default — historical "log and continue" stance preserved for existing pipelines. CI jobs that need to detect silent breakage should turn it on. Even without `--strict`, a catastrophic outcome (0 of N data items inserted) is always reported as an error. |
 
 The same tuning fields are persisted per-profile in `~/.config/diet/config.yml` via the wizard:
 
@@ -166,7 +172,9 @@ For local development, CI fixtures, and one-shot migrations where you have direc
 - Postgres-side constraints (FK, NOT NULL, CHECK, UNIQUE) are still enforced.
 - Topological collection order is preserved, same as the REST path.
 - Auto-increment sequences are bumped to `MAX(pk)` after the load so the next admin-panel insert doesn't collide with imported IDs.
-- **FK-failure recovery**: when a row fails to insert because a foreign-key reference doesn't resolve in the target (e.g. `created_by` pointing to a user that wasn't imported), diet parses the failing column out of the Postgres error, sets it to `NULL`, and retries the row — same row lands, just without the dangling reference. Loops until the row inserts or all FK columns are exhausted. This matches what the REST path effectively gets for free, and on real-world archives ends up importing more rows than the REST path (which sometimes gives up on whole batches).
+- **FK-failure recovery**: when a row fails to insert because a foreign-key reference doesn't resolve in the target (e.g. `created_by` pointing to a user that wasn't imported), diet parses the failing column out of the Postgres error, sets it to `NULL`, and retries the row — same row lands, just without the dangling reference. Loops until the row inserts or all FK columns are exhausted. On nullable FK columns this matches what the REST path effectively gets for free.
+
+**Edge case the direct-DB path can't recover (and REST can):** when an FK column is **NOT NULL** in the target schema (e.g. an audit table where `created_by NOT NULL` references `directus_users`, and the referenced user wasn't imported), the recovery loop sets the column to `NULL` and Postgres rejects the row with a NOT NULL violation. Direct-DB drops these rows and emits a `WARN: <collection>: N rows dropped (NOT NULL FK to missing reference; REST path auto-fills these...)` message; the REST path doesn't hit this because Directus auto-substitutes the importing token's user ID. If the affected rows matter, re-run that collection without `--db-dsn`.
 
 **What's bypassed:**
 - Directus permissions / ACL checks.
@@ -226,3 +234,4 @@ go test -race -count=1 ./...
 
 - **Sort field** — The `meta.sort_field` property on collections (used for drag-and-drop sorting in Directus UI) is not recreated on import. This field is managed by Directus internally and requires manual setup after import.
 - **Users/permissions** — Not included in system entity export to avoid sensitive data and cross-instance reference issues.
+- **System collections without inbound relations** — custom fields on `directus_*` collections are picked up only when at least one of your user-collection relations references them. Standalone fields (e.g. a custom `nickname` column on `directus_users` with no FK pointing at it) are not exported. If you need those, export them manually or open an issue.

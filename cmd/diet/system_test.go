@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,7 +155,13 @@ func TestExtractSystemItemLabel_UserFirstNameOnly(t *testing.T) {
 }
 
 func TestStripSensitiveFields_Users(t *testing.T) {
-	item := json.RawMessage(`{"id":"u1","email":"a@b.com","password":"hash","token":"secret","last_access":"2024-01-01","last_page":"/admin","role":"admin-role"}`)
+	item := json.RawMessage(`{
+		"id":"u1","email":"a@b.com","role":"admin-role",
+		"password":"hash","token":"secret",
+		"tfa_secret":"JBSWY3DPEHPK3PXP","auth_data":{"refresh":"sso-refresh-tok"},
+		"last_access":"2024-01-01","last_page":"/admin",
+		"external_identifier":"sso-id-123","provider":"oauth"
+	}`)
 	result := stripSensitiveFields("users", item)
 
 	var obj map[string]json.RawMessage
@@ -162,15 +169,40 @@ func TestStripSensitiveFields_Users(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	for _, field := range []string{"password", "token", "last_access", "last_page"} {
+	// Every entry in sensitiveUserFields must be gone — drives off the
+	// canonical list so tests don't drift from the implementation.
+	for _, field := range sensitiveUserFields {
 		if _, ok := obj[field]; ok {
 			t.Errorf("field %q should be stripped from users", field)
 		}
 	}
-	for _, field := range []string{"id", "email", "role"} {
+	// Identity / metadata kept.
+	for _, field := range []string{"id", "email", "role", "external_identifier", "provider"} {
 		if _, ok := obj[field]; !ok {
 			t.Errorf("field %q should be preserved", field)
 		}
+	}
+}
+
+// TestStripSensitiveFields_TFASecret_Explicit — pin tfa_secret behavior on
+// its own so a future refactor that removes it from sensitiveUserFields
+// fails this test loudly. TOTP secrets are the strictest case in the
+// list; the test exists to prevent silent re-introduction.
+func TestStripSensitiveFields_TFASecret_Explicit(t *testing.T) {
+	item := json.RawMessage(`{"id":"u1","tfa_secret":"DO-NOT-LEAK","email":"x@y.z"}`)
+	result := stripSensitiveFields("users", item)
+	if strings.Contains(string(result), "DO-NOT-LEAK") {
+		t.Errorf("tfa_secret value leaked into export: %s", result)
+	}
+}
+
+// TestStripSensitiveFields_AuthData_Explicit — same pin for auth_data,
+// which holds SSO refresh material.
+func TestStripSensitiveFields_AuthData_Explicit(t *testing.T) {
+	item := json.RawMessage(`{"id":"u1","auth_data":{"refresh":"DO-NOT-LEAK"},"email":"x@y.z"}`)
+	result := stripSensitiveFields("users", item)
+	if strings.Contains(string(result), "DO-NOT-LEAK") {
+		t.Errorf("auth_data leaked into export: %s", result)
 	}
 }
 
@@ -251,6 +283,145 @@ func TestInsertSystemItems_EmptyInput(t *testing.T) {
 	inserted, failed := insertSystemItems(c, "/flows", nil)
 	if inserted != 0 || failed != 0 {
 		t.Errorf("inserted=%d failed=%d, want 0/0", inserted, failed)
+	}
+}
+
+// TestFetchAllSystemEntities — verifies the helper that fills the same shape
+// the TUI does for `--plain --system` exports: independent entity types pulled
+// whole, dependent ones (operations/panels) pulled whole, presets filtered to
+// the user's collection set (with global presets — empty `collection` —
+// kept).
+func TestFetchAllSystemEntities(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/flows":
+			w.Write([]byte(`{"data":[{"id":"f1","name":"Flow A"},{"id":"f2","name":"Flow B"}]}`))
+		case "/dashboards":
+			w.Write([]byte(`{"data":[{"id":"d1","name":"Sales"}]}`))
+		case "/roles":
+			w.Write([]byte(`{"data":[{"id":"r1","name":"Editor"}]}`))
+		case "/users":
+			// Sensitive fields must be stripped post-fetch.
+			w.Write([]byte(`{"data":[{"id":"u1","email":"a@b.c","password":"HASH","token":"TOK"}]}`))
+		case "/translations":
+			w.Write([]byte(`{"data":[{"id":"t1","key":"hello","value":"Hi"}]}`))
+		case "/webhooks":
+			w.Write([]byte(`{"data":[]}`))
+		case "/operations":
+			w.Write([]byte(`{"data":[{"id":"o1","flow":"f1"}]}`))
+		case "/panels":
+			w.Write([]byte(`{"data":[{"id":"p1","dashboard":"d1"}]}`))
+		case "/presets":
+			w.Write([]byte(`{"data":[
+				{"id":1,"collection":"posts"},
+				{"id":2,"collection":"unrelated"},
+				{"id":3,"collection":""}
+			]}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	userColSet := map[string]bool{"posts": true}
+
+	got := fetchAllSystemEntities(c, userColSet, nil)
+
+	for _, name := range []string{"flows", "dashboards", "roles", "users", "translations", "operations", "panels", "presets"} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("missing entity type %s", name)
+		}
+	}
+	// Empty webhooks list must not produce a key.
+	if _, ok := got["webhooks"]; ok {
+		t.Errorf("empty webhooks should not appear in result")
+	}
+
+	// Users password/token must be stripped (mirror TUI).
+	var u map[string]json.RawMessage
+	json.Unmarshal(got["users"][0], &u)
+	if _, has := u["password"]; has {
+		t.Errorf("user password not stripped")
+	}
+	if _, has := u["token"]; has {
+		t.Errorf("user token not stripped")
+	}
+
+	// Presets filter: posts (in set) + global "" preset kept; unrelated dropped.
+	if len(got["presets"]) != 2 {
+		t.Errorf("presets count = %d, want 2 (posts + global)", len(got["presets"]))
+	}
+	for _, p := range got["presets"] {
+		var obj struct {
+			Collection string `json:"collection"`
+		}
+		json.Unmarshal(p, &obj)
+		if obj.Collection == "unrelated" {
+			t.Errorf("preset for unrelated collection should be filtered out")
+		}
+	}
+}
+
+// TestFetchAllSystemEntities_NilUserSet — passing nil userColSet keeps every
+// preset (no collection filter), used for "give me literally everything".
+func TestFetchAllSystemEntities_NilUserSet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/presets":
+			w.Write([]byte(`{"data":[{"id":1,"collection":"a"},{"id":2,"collection":"b"}]}`))
+		default:
+			w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer srv.Close()
+	c := newClient(srv.URL, "tok")
+	got := fetchAllSystemEntities(c, nil, nil)
+	if len(got["presets"]) != 2 {
+		t.Errorf("expected 2 presets when userColSet=nil, got %d", len(got["presets"]))
+	}
+}
+
+// TestFetchAllSystemEntities_PartialErrorsLogged — if one endpoint fails, the
+// rest still come back. Failure surfaces via the log func, not as panic or
+// missing-value cascade.
+func TestFetchAllSystemEntities_PartialErrorsLogged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/users" {
+			w.WriteHeader(500)
+			w.Write([]byte(`{"errors":[{"message":"boom"}]}`))
+			return
+		}
+		if r.URL.Path == "/flows" {
+			w.Write([]byte(`{"data":[{"id":"f1"}]}`))
+			return
+		}
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
+	c := newClient(srv.URL, "tok")
+
+	var logs []string
+	got := fetchAllSystemEntities(c, nil, func(s string) { logs = append(logs, s) })
+
+	if _, ok := got["users"]; ok {
+		t.Errorf("users should be absent after fetch failure")
+	}
+	if len(got["flows"]) != 1 {
+		t.Errorf("flows still expected after sibling failure, got %d", len(got["flows"]))
+	}
+	hasUserWarning := false
+	for _, l := range logs {
+		if strings.Contains(l, "users") && strings.Contains(l, "WARN") {
+			hasUserWarning = true
+		}
+	}
+	if !hasUserWarning {
+		t.Errorf("expected WARN log for failed users fetch, got %v", logs)
 	}
 }
 

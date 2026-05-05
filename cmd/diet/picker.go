@@ -1489,6 +1489,18 @@ func (m pickerModel) exportWorker(names []string, systemItems map[string][]json.
 			exportRelations = append(exportRelations, r)
 		}
 	}
+
+	// Pull custom fields on system collections referenced by exported
+	// relations (e.g. directus_users.game_accounts as the M2M alias side
+	// of a junction). See fetchSystemCustomFields for the why.
+	systemFields, err := fetchSystemCustomFields(client, exportRelations, selectedSet)
+	if err != nil {
+		ch <- exportErrorMsg{err}
+		return
+	}
+	if len(systemFields) > 0 {
+		allFields = append(allFields, systemFields...)
+	}
 	send("Fetching schema", "done", 3, 3)
 
 	// Phase 2: Data
