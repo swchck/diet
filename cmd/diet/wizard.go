@@ -165,6 +165,15 @@ type wizardModel struct {
 	selectedTarget  string
 	inputFile       string
 
+	// Step: import file — list of archives discovered in the current
+	// working directory, populated by buildFileInput. Sorted with most
+	// recently modified first since the typical flow is "exported a
+	// minute ago, want to import now". The textinput stays the
+	// authoritative source of truth; this list is just suggestions
+	// the user can tab/up-down through.
+	fileSuggestions   []string
+	fileSuggestionIdx int // -1 = textinput focused; >=0 = list cursor
+
 	done      bool
 	cancelled bool
 	width     int
@@ -209,6 +218,46 @@ func (m *wizardModel) buildFileInput() {
 	m.inputs[0] = newInput("diet-export-20240115-100000.tar.zst", "")
 	m.focusIdx = 0
 	m.inputs[0].Focus()
+	m.fileSuggestions = scanLocalArchives(".")
+	m.fileSuggestionIdx = -1
+}
+
+// scanLocalArchives returns a list of `*.tar.zst` and `*.zip` files in
+// the given directory, most-recently-modified first. Anything else is
+// ignored — the wizard cares about diet archives, not arbitrary files.
+// On error (unreadable dir) returns nil silently; the textinput still
+// works as a fallback for users with archives elsewhere.
+func scanLocalArchives(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	type sortable struct {
+		name  string
+		mtime int64
+	}
+	var found []sortable
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".tar.zst") && !strings.HasSuffix(name, ".zip") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		found = append(found, sortable{name: name, mtime: info.ModTime().Unix()})
+	}
+	// Newest first.
+	sort.Slice(found, func(i, j int) bool { return found[i].mtime > found[j].mtime })
+	out := make([]string, len(found))
+	for i, s := range found {
+		out[i] = s.name
+	}
+	return out
 }
 
 func newInput(placeholder, value string) textinput.Model {
@@ -419,6 +468,13 @@ func (m wizardModel) handleNewProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m wizardModel) handleFileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		// If the suggestion list is focused, accept the highlighted
+		// suggestion as the path. Otherwise read the textinput.
+		if m.fileSuggestionIdx >= 0 && m.fileSuggestionIdx < len(m.fileSuggestions) {
+			m.inputFile = m.fileSuggestions[m.fileSuggestionIdx]
+			m.goToProfileSelect(stepImportTarget)
+			return m, nil
+		}
 		if strings.TrimSpace(m.inputs[0].Value()) != "" {
 			m.inputFile = strings.TrimSpace(m.inputs[0].Value())
 			m.goToProfileSelect(stepImportTarget)
@@ -426,7 +482,67 @@ func (m wizardModel) handleFileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.step = stepOperation
 		return m, nil
+	case "down":
+		// Move from the textinput into the suggestion list, or down
+		// within it. Wraps at the bottom back into the textinput.
+		if len(m.fileSuggestions) == 0 {
+			return m, nil
+		}
+		switch {
+		case m.fileSuggestionIdx < 0:
+			m.fileSuggestionIdx = 0
+			m.inputs[0].Blur()
+		case m.fileSuggestionIdx < len(m.fileSuggestions)-1:
+			m.fileSuggestionIdx++
+		default:
+			m.fileSuggestionIdx = -1
+			m.inputs[0].Focus()
+		}
+		return m, nil
+	case "up":
+		if len(m.fileSuggestions) == 0 {
+			return m, nil
+		}
+		switch {
+		case m.fileSuggestionIdx < 0:
+			m.fileSuggestionIdx = len(m.fileSuggestions) - 1
+			m.inputs[0].Blur()
+		case m.fileSuggestionIdx > 0:
+			m.fileSuggestionIdx--
+		default:
+			m.fileSuggestionIdx = -1
+			m.inputs[0].Focus()
+		}
+		return m, nil
+	case "tab":
+		// Tab autocompletes the textinput from the first matching
+		// suggestion. If nothing matches the current prefix, fall
+		// through to the textinput's default tab handling so the
+		// caret moves predictably.
+		typed := strings.TrimSpace(m.inputs[0].Value())
+		if typed != "" {
+			for _, s := range m.fileSuggestions {
+				if strings.HasPrefix(s, typed) {
+					m.inputs[0].SetValue(s)
+					m.inputs[0].CursorEnd()
+					return m, nil
+				}
+			}
+		}
+		// Empty input + tab: jump into the suggestion list at top.
+		if len(m.fileSuggestions) > 0 {
+			m.fileSuggestionIdx = 0
+			m.inputs[0].Blur()
+		}
+		return m, nil
 	default:
+		// Any other key: if list is focused, ignore (keeps the user
+		// from accidentally typing into a hidden textinput). When
+		// textinput is focused, forward the keypress so typing,
+		// backspace, etc. work as usual.
+		if m.fileSuggestionIdx >= 0 {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.inputs[m.focusIdx], cmd = m.inputs[m.focusIdx].Update(msg)
 		return m, cmd
@@ -511,7 +627,12 @@ func (m wizardModel) wizardBanner() string {
 // wizardHints renders a row of colored key chips for the current step.
 func (m wizardModel) wizardHints() string {
 	switch m.step {
-	case stepNewProfile, stepNewTarget, stepImportFile:
+	case stepImportFile:
+		return renderKeyHint("↑↓", "browse") + "   " +
+			renderKeyHint("tab", "complete") + "   " +
+			renderKeyHint("enter", "confirm") + "   " +
+			renderKeyHint("esc", "back")
+	case stepNewProfile, stepNewTarget:
 		return renderKeyHint("tab", "next field") + "   " +
 			renderKeyHint("enter", "confirm") + "   " +
 			renderKeyHint("esc", "back")
@@ -539,7 +660,7 @@ func (m wizardModel) View() string {
 	case stepNewProfile, stepNewTarget:
 		body = m.viewInputStep()
 	case stepImportFile:
-		body = m.viewInputStep()
+		body = m.viewFileStep()
 	}
 
 	box := lipgloss.NewStyle().
@@ -672,6 +793,62 @@ func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) stri
 		heading,
 		"",
 		lipgloss.NewStyle().Width(56).Render(body),
+		"",
+		m.wizardHints(),
+	)
+}
+
+// viewFileStep is a specialised input step that combines the textinput
+// (canonical source for the path) with a list of archives discovered in
+// the current working directory. The user can type a path, press tab to
+// autocomplete from the first matching suggestion, or arrow down into
+// the list and pick a file directly. This solves the original UX gripe
+// that "there's no hint what archives I have here".
+func (m wizardModel) viewFileStep() string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(labelCol).
+		Width(14).
+		Align(lipgloss.Right)
+	if m.fileSuggestionIdx < 0 {
+		labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+	}
+	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		labelStyle.Render(m.labels[0]+" "),
+		m.inputs[0].View(),
+	)
+
+	parts := []string{inputRow}
+
+	// Render the suggestions block.
+	if len(m.fileSuggestions) > 0 {
+		hint := lipgloss.NewStyle().Foreground(dimColor).Italic(true).
+			Render(fmt.Sprintf("  Found %d archive(s) in current directory (newest first):",
+				len(m.fileSuggestions)))
+		parts = append(parts, "", hint)
+		for i, name := range m.fileSuggestions {
+			cursor := "  "
+			nameStyled := lipgloss.NewStyle().Foreground(labelCol).Render(name)
+			if i == m.fileSuggestionIdx {
+				cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
+				nameStyled = lipgloss.NewStyle().Foreground(valueCol).Bold(true).Render(name)
+			}
+			parts = append(parts, "  "+cursor+nameStyled)
+		}
+	} else {
+		hint := lipgloss.NewStyle().Foreground(dimColor).Italic(true).
+			Render("  (no .tar.zst or .zip archives found in current directory)")
+		parts = append(parts, "", hint)
+	}
+
+	body := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	return lipgloss.JoinVertical(lipgloss.Center,
+		m.wizardBanner(),
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(72).Render(body),
 		"",
 		m.wizardHints(),
 	)
