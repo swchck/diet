@@ -276,6 +276,62 @@ func TestFilterSystemSubset_NoOp(t *testing.T) {
 	}
 }
 
+// TestStripFolderCollections covers the --no-folders trim. Folders are
+// detected via Schema being null/empty; real tables have a non-empty
+// Schema and must survive.
+func TestStripFolderCollections_DropsFoldersKeepsTables(t *testing.T) {
+	cols := []CollectionInfo{
+		{Collection: "ACL", Schema: json.RawMessage(`null`)},
+		{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)},
+		{Collection: "Empty", Schema: json.RawMessage(``)}, // also folder-like
+		{Collection: "tags", Schema: json.RawMessage(`{"name":"tags"}`)},
+	}
+	out, dropped := stripFolderCollections(cols)
+	if dropped != 2 {
+		t.Errorf("dropped = %d, want 2 (ACL + Empty)", dropped)
+	}
+	if len(out) != 2 {
+		t.Fatalf("kept = %d, want 2", len(out))
+	}
+	got := []string{out[0].Collection, out[1].Collection}
+	if !slices.Contains(got, "posts") || !slices.Contains(got, "tags") {
+		t.Errorf("expected posts+tags kept, got %v", got)
+	}
+}
+
+// TestStripFolderCollections_NoFoldersIsPassThrough — when the slice has
+// no folders, we shouldn't allocate. Validates the fast path.
+func TestStripFolderCollections_NoFoldersIsPassThrough(t *testing.T) {
+	cols := []CollectionInfo{
+		{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)},
+		{Collection: "tags", Schema: json.RawMessage(`{"name":"tags"}`)},
+	}
+	out, dropped := stripFolderCollections(cols)
+	if dropped != 0 {
+		t.Errorf("dropped = %d on no-folders input, want 0", dropped)
+	}
+	// Same backing slice — verifies pass-through, not a copy.
+	if &cols[0] != &out[0] {
+		t.Errorf("expected pass-through (same slice), got new alloc")
+	}
+}
+
+// TestStripFolderCollections_AllFolders — pathological all-folder input
+// returns an empty slice without panicking.
+func TestStripFolderCollections_AllFolders(t *testing.T) {
+	cols := []CollectionInfo{
+		{Collection: "ACL", Schema: json.RawMessage(`null`)},
+		{Collection: "Clans", Schema: json.RawMessage(`null`)},
+	}
+	out, dropped := stripFolderCollections(cols)
+	if dropped != 2 {
+		t.Errorf("dropped = %d, want 2", dropped)
+	}
+	if len(out) != 0 {
+		t.Errorf("kept = %d, want 0", len(out))
+	}
+}
+
 func mapKeys(m map[string][]json.RawMessage) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

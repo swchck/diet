@@ -90,19 +90,138 @@ func TestImportPicker_NavigationDoesNotWrap(t *testing.T) {
 	}
 }
 
-// TestImportPicker_Confirm — enter sets confirmed=true and quits.
+// TestImportPicker_Confirm — `enter` on the items page advances to the
+// params page; a second `enter` on the params page confirms and quits.
+// The two-step flow exists so users can review safety toggles before
+// triggering a destructive operation.
 func TestImportPicker_Confirm(t *testing.T) {
 	m := newImportPickerModel([]string{"a"}, nil, "x")
+	// First enter — should advance to params, NOT confirm.
+	m = step(m, keyNamed(tea.KeyEnter))
+	if m.confirmed {
+		t.Errorf("first enter should not confirm — should advance to params")
+	}
+	if m.page != pagePickParams {
+		t.Errorf("page = %v, want params after first enter", m.page)
+	}
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want 0 after page transition", m.cursor)
+	}
+	// Second enter — confirms.
 	out, cmd := m.Update(keyNamed(tea.KeyEnter))
 	mm := out.(importPickerModel)
 	if !mm.confirmed {
-		t.Errorf("confirmed=false after enter")
-	}
-	if mm.cancelled {
-		t.Errorf("cancelled=true after enter")
+		t.Errorf("confirmed=false after second enter")
 	}
 	if cmd == nil {
 		t.Errorf("expected tea.Quit cmd after confirm")
+	}
+}
+
+// TestImportPicker_ParamsDefaults — the params page must start with
+// safety-first defaults. Concretely: --no-folders ON; data import ON
+// (skip-data OFF); accountability untouched (strip-accountability OFF).
+//
+// This is the contract the user explicitly asked for ("включёнными
+// дефолтами которые дают безопасность"). Don't loosen without asking.
+func TestImportPicker_ParamsDefaults(t *testing.T) {
+	m := newImportPickerModel([]string{"a"}, nil, "x")
+	opts := m.collectOptions()
+	if !opts.NoFolders {
+		t.Errorf("NoFolders default = false, want true (safety)")
+	}
+	if opts.SkipData {
+		t.Errorf("SkipData default = true, want false (data flows by default)")
+	}
+	if opts.StripAccountability {
+		t.Errorf("StripAccountability default = true, want false (don't mutate target meta)")
+	}
+}
+
+// TestImportPicker_ToggleParam — space on the cursor flips the highlighted
+// param. Verifies that handleParamsKey is wired to the params slice and not
+// still toggling items.
+func TestImportPicker_ToggleParam(t *testing.T) {
+	m := newImportPickerModel([]string{"a"}, nil, "x")
+	m = step(m, keyNamed(tea.KeyEnter)) // advance to params
+	if m.params[0].on != true {
+		t.Fatalf("params[0] (no-folders) default off, want on")
+	}
+	m = step(m, keyRune(' ')) // toggle no-folders off
+	if m.params[0].on {
+		t.Errorf("after toggle, no-folders still on")
+	}
+	if !m.collectOptions().NoFolders == false {
+		// nothing — sanity for the inverse direction:
+	}
+	if m.collectOptions().NoFolders {
+		t.Errorf("collectOptions reports NoFolders=true after toggle off")
+	}
+}
+
+// TestImportPicker_BackFromParamsToItems — `b` (or backspace, left, h)
+// returns from params to items. cursor resets so the user lands at the top.
+func TestImportPicker_BackFromParamsToItems(t *testing.T) {
+	m := newImportPickerModel([]string{"a", "b"}, nil, "x")
+	m = step(m, keyRune('j'))           // cursor=1
+	m = step(m, keyNamed(tea.KeyEnter)) // advance to params
+	m = step(m, keyRune('j'))           // params cursor=1
+	m = step(m, keyRune('b'))           // back
+	if m.page != pagePickItems {
+		t.Errorf("page = %v, want items after back", m.page)
+	}
+	if m.cursor != 0 {
+		t.Errorf("cursor not reset after back: %d", m.cursor)
+	}
+}
+
+// TestImportPicker_View_ParamsPage — the params page renders the
+// step-2-of-2 hint, every label and description from defaultParamItems,
+// and the legend for the * marker.
+func TestImportPicker_View_ParamsPage(t *testing.T) {
+	m := newImportPickerModel([]string{"a"}, nil, "x")
+	m = step(m, keyNamed(tea.KeyEnter)) // advance
+	v := m.View()
+	for _, want := range []string{
+		"Step 2 of 2",
+		"Skip folder collections",
+		"Skip data import",
+		"Strip accountability",
+		"changed from default",
+	} {
+		if !contains(v, want) {
+			t.Errorf("params view missing %q: %s", want, v)
+		}
+	}
+}
+
+// TestImportPicker_CollectOptions_ReadsToggleState — flipping each
+// individual param is reflected in collectOptions output. Guards against
+// future drift between the param key strings and the typed struct fields.
+func TestImportPicker_CollectOptions_ReadsToggleState(t *testing.T) {
+	m := newImportPickerModel([]string{"a"}, nil, "x")
+	m = step(m, keyNamed(tea.KeyEnter)) // params
+	// Toggle every row off (or on, depending on default) — verify each
+	// transition reflects in collectOptions.
+	for i := range m.params {
+		m.cursor = i
+		before := m.params[i].on
+		m = step(m, keyRune(' '))
+		after := m.collectOptions()
+		switch m.params[i].key {
+		case "no-folders":
+			if after.NoFolders == before {
+				t.Errorf("no-folders not flipped in collectOptions")
+			}
+		case "skip-data":
+			if after.SkipData == before {
+				t.Errorf("skip-data not flipped in collectOptions")
+			}
+		case "strip-accountability":
+			if after.StripAccountability == before {
+				t.Errorf("strip-accountability not flipped in collectOptions")
+			}
+		}
 	}
 }
 

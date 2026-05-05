@@ -24,11 +24,19 @@ import (
 type profile struct {
 	URL         string `yaml:"url"`
 	Token       string `yaml:"token"`
-	Concurrency int    `yaml:"concurrency,omitempty"` // parallel workers (default 6)
-	Timeout     int    `yaml:"timeout,omitempty"`     // HTTP timeout in seconds (default 60)
-	BatchSize   int    `yaml:"batch_size,omitempty"`  // items per batch POST (default 100)
+	Concurrency int    `yaml:"concurrency,omitempty"`  // parallel workers (default 6)
+	Timeout     int    `yaml:"timeout,omitempty"`      // HTTP timeout in seconds (default 60)
+	BatchSize   int    `yaml:"batch_size,omitempty"`   // items per batch POST (default 100)
 	RetryPasses int    `yaml:"retry_passes,omitempty"` // max retry passes (default 5)
-	Format      string `yaml:"format,omitempty"`      // archive format: zstd or zip (default zstd)
+	Format      string `yaml:"format,omitempty"`       // archive format: zstd or zip (default zstd)
+	// Unsafe marks a profile as production / shared / "you really do
+	// not want to nuke this by accident". When true, every wizard-
+	// driven import (against this profile as target) and every clean
+	// (against this profile as source) shows a typed-host confirmation
+	// prompt — y/N isn't enough, the user has to retype the URL host.
+	// CLI direct invocations (diet import --target-url=...) do NOT
+	// consult this field, so automation pipelines aren't blocked.
+	Unsafe bool `yaml:"unsafe,omitempty"`
 }
 
 func (p profile) clientOptions() clientOptions {
@@ -882,6 +890,16 @@ func runWizard() error {
 		}
 
 	case "import":
+		// Profiles flagged unsafe (typically prod) require an extra
+		// typed-host confirmation. Importing can rewrite schema and
+		// data; muscle-memory `enter` on the wrong target was the
+		// motivating accident.
+		if res.targetProf.Unsafe {
+			if !confirmUnsafeFromTTY("import", res.targetProf.URL) {
+				fmt.Println("Aborted.")
+				return nil
+			}
+		}
 		client := newClientWithOptions(res.targetProf.URL, res.targetProf.Token, res.targetProf.clientOptions())
 		if err := executeImport(client, res.inputFile, importOpts{
 			Data:                true,
@@ -893,6 +911,15 @@ func runWizard() error {
 		}
 
 	case "clean":
+		// Same gate as import — clean deletes collections / system
+		// items, so an unsafe profile must demand an explicit retype
+		// before we even open the picker.
+		if res.prof.Unsafe {
+			if !confirmUnsafeFromTTY("clean", res.prof.URL) {
+				fmt.Println("Aborted.")
+				return nil
+			}
+		}
 		client := newClientWithOptions(res.prof.URL, res.prof.Token, res.prof.clientOptions())
 		picker := newPicker(client, res.prof.URL, res.profileName, "", "", modeClean)
 		cp := tea.NewProgram(picker, tea.WithAltScreen())
