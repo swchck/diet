@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -35,9 +36,6 @@ type pickedOptions struct {
 	// shifts.
 	NoFolders bool
 	// SkipData skips the data-import phase entirely (schema-only run).
-	// Useful when you want to land a new collection's structure first
-	// and load rows separately, or when the archive itself has zero
-	// rows for the kept collections.
 	SkipData bool
 	// StripAccountability rewrites meta.accountability=null on imported
 	// collections — faster import but mutates the meta of every
@@ -50,10 +48,9 @@ type pickedOptions struct {
 // interactive picker so the user can choose which collections and
 // system entity types to import. Returns nil on cancel.
 //
-// The picker is intentionally simpler than the export-side TUI — there
-// the user has to pick from a *live* server with full schema info,
-// here all we need is a checkable list of names parsed from the
-// archive's manifest.
+// The visual language matches the export-side picker (tabs + bubbles
+// table for items) and the wizard's bordered framing (params page),
+// so users moving between operations see consistent UI.
 func runImportPicker(inputPath string) (*pickedSubset, error) {
 	manifest, _, _, _, err := extractArchive(inputPath)
 	if err != nil {
@@ -69,7 +66,7 @@ func runImportPicker(inputPath string) (*pickedSubset, error) {
 		return nil, fmt.Errorf("archive contains nothing importable: no user collections, no system entities")
 	}
 
-	model := newImportPickerModel(cols, sys, inputPath)
+	model := newImportPickerModel(cols, sys, inputPath, manifest)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	final, err := p.Run()
 	if err != nil {
@@ -97,11 +94,16 @@ type pickerItem struct {
 	kind     itemKind
 	name     string
 	selected bool
+	// itemCount is the number of rows the archive has for this
+	// collection (0 for system entities — those have their own counts
+	// reported separately by the manifest).
+	itemCount int
 }
 
-// pickerPage is the two-step wizard state. Page 1 (items) is the original
-// behavior; page 2 (params) was added so users on a "ship one collection
-// to prod" path can review safety toggles before triggering the apply.
+// pickerPage is the two-step picker state. Page 1 (items) is the table
+// of collections + system entities; page 2 (params) is the safety-
+// toggles screen. Splitting them keeps each screen visually tidy and
+// lets `b` walk back without losing the items selection.
 type pickerPage int
 
 const (
@@ -109,9 +111,7 @@ const (
 	pagePickParams
 )
 
-// paramItem is a row on the parameters page. `key` identifies which option
-// the row drives; `on` is the current value; `defaultOn` lets us render
-// "(default)" hints. `desc` is the inline help line shown on the next row.
+// paramItem is a row on the parameters page.
 type paramItem struct {
 	key       string
 	label     string
@@ -120,16 +120,37 @@ type paramItem struct {
 	defaultOn bool
 }
 
+// importTab labels the segments shown above the items table.
+type importTab struct {
+	label string
+	kind  itemKind
+}
+
 type importPickerModel struct {
-	page        pickerPage
-	inputPath   string
-	items       []pickerItem
+	page      pickerPage
+	inputPath string
+
+	// Archive metadata for the header block.
+	sourceURL       string
+	directusVersion string
+	exportedAt      string
+
+	// Items page
+	items     []pickerItem
+	tabs      []importTab
+	activeTab int
+	tbl       table.Model
+	tblReady  bool
+
+	// Params page
 	params      []paramItem
-	cursor      int // active row on current page
-	width       int
-	height      int
-	confirmed   bool
-	cancelled   bool
+	paramCursor int
+
+	// State
+	width     int
+	height    int
+	confirmed bool
+	cancelled bool
 }
 
 // defaultParamItems returns the safety-first defaults shown on the params
@@ -161,19 +182,36 @@ func defaultParamItems() []paramItem {
 	}
 }
 
-func newImportPickerModel(cols, sys []string, inputPath string) importPickerModel {
+func newImportPickerModel(cols, sys []string, inputPath string, manifest Manifest) importPickerModel {
 	items := make([]pickerItem, 0, len(cols)+len(sys))
 	for _, c := range cols {
-		items = append(items, pickerItem{kind: itemKindCollection, name: c, selected: true})
+		items = append(items, pickerItem{
+			kind:      itemKindCollection,
+			name:      c,
+			selected:  true,
+			itemCount: manifest.ItemCounts[c],
+		})
 	}
 	for _, s := range sys {
 		items = append(items, pickerItem{kind: itemKindSystem, name: s, selected: true})
 	}
-	return importPickerModel{
-		inputPath: inputPath,
-		items:     items,
-		params:    defaultParamItems(),
+
+	tabs := []importTab{{label: "Collections", kind: itemKindCollection}}
+	if len(sys) > 0 {
+		tabs = append(tabs, importTab{label: "System Entities", kind: itemKindSystem})
 	}
+
+	m := importPickerModel{
+		inputPath:       inputPath,
+		sourceURL:       manifest.SourceURL,
+		directusVersion: manifest.DirectusVersion,
+		exportedAt:      manifest.ExportedAt,
+		items:           items,
+		tabs:            tabs,
+		params:          defaultParamItems(),
+	}
+	m.rebuildTable()
+	return m
 }
 
 func (m importPickerModel) selected(kind itemKind) []string {
@@ -204,6 +242,113 @@ func (m importPickerModel) collectOptions() pickedOptions {
 	return opts
 }
 
+// activeKind returns the itemKind backing the current tab. With no system
+// entities in the archive, the second tab simply doesn't exist and we
+// always render collections.
+func (m importPickerModel) activeKind() itemKind {
+	if m.activeTab >= 0 && m.activeTab < len(m.tabs) {
+		return m.tabs[m.activeTab].kind
+	}
+	return itemKindCollection
+}
+
+func (m *importPickerModel) rebuildTable() {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	nameW := max(w-22, 30)
+
+	kind := m.activeKind()
+	var cols []table.Column
+	if kind == itemKindCollection {
+		cols = []table.Column{
+			{Title: "", Width: 3},
+			{Title: "Collection", Width: nameW},
+			{Title: "Items", Width: 10},
+		}
+	} else {
+		cols = []table.Column{
+			{Title: "", Width: 3},
+			{Title: "Entity type", Width: nameW},
+			{Title: "", Width: 10},
+		}
+	}
+
+	rows := make([]table.Row, 0, len(m.items))
+	for _, it := range m.items {
+		if it.kind != kind {
+			continue
+		}
+		check := "[ ]"
+		if it.selected {
+			check = "[x]"
+		}
+		count := ""
+		if it.kind == itemKindCollection {
+			count = fmt.Sprintf("%d", it.itemCount)
+		}
+		rows = append(rows, table.Row{check, it.name, count})
+	}
+
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(borderColor).
+		BorderBottom(true).
+		Bold(true)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color("229")).
+		Background(lipgloss.Color("57")).
+		Bold(false)
+
+	height := max(m.height-12, 5)
+	if !m.tblReady {
+		m.tbl = table.New(
+			table.WithColumns(cols),
+			table.WithRows(rows),
+			table.WithFocused(true),
+			table.WithHeight(height),
+			table.WithStyles(s),
+		)
+		m.tblReady = true
+		return
+	}
+	cursor := m.tbl.Cursor()
+	m.tbl.SetColumns(cols)
+	m.tbl.SetRows(rows)
+	m.tbl.SetHeight(height)
+	if cursor >= len(rows) {
+		cursor = len(rows) - 1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	m.tbl.SetCursor(cursor)
+}
+
+// activeItemIndex maps the current table cursor (which counts only rows
+// of the active kind) back to an index into m.items (which holds both
+// kinds). Returns -1 when there's no row under the cursor.
+func (m importPickerModel) activeItemIndex() int {
+	if !m.tblReady {
+		return -1
+	}
+	target := m.tbl.Cursor()
+	kind := m.activeKind()
+	pos := 0
+	for i, it := range m.items {
+		if it.kind != kind {
+			continue
+		}
+		if pos == target {
+			return i
+		}
+		pos++
+	}
+	return -1
+}
+
 func (m importPickerModel) Init() tea.Cmd { return nil }
 
 func (m importPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -211,6 +356,8 @@ func (m importPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.rebuildTable()
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -239,56 +386,72 @@ func (m importPickerModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m importPickerModel) handleItemsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, importPickerKeys.up):
-		if m.cursor > 0 {
-			m.cursor--
-		}
-	case key.Matches(msg, importPickerKeys.down):
-		if m.cursor < len(m.items)-1 {
-			m.cursor++
-		}
 	case key.Matches(msg, importPickerKeys.toggle):
-		if len(m.items) > 0 {
-			m.items[m.cursor].selected = !m.items[m.cursor].selected
+		if idx := m.activeItemIndex(); idx >= 0 {
+			m.items[idx].selected = !m.items[idx].selected
+			m.rebuildTable()
 		}
+		return m, nil
 	case key.Matches(msg, importPickerKeys.toggleAll):
+		// Flip the bulk state for the active tab only.
+		kind := m.activeKind()
 		anyOff := false
 		for _, it := range m.items {
-			if !it.selected {
+			if it.kind == kind && !it.selected {
 				anyOff = true
 				break
 			}
 		}
 		for i := range m.items {
-			m.items[i].selected = anyOff
+			if m.items[i].kind == kind {
+				m.items[i].selected = anyOff
+			}
 		}
+		m.rebuildTable()
+		return m, nil
+	case key.Matches(msg, importPickerKeys.tab):
+		if len(m.tabs) > 1 {
+			m.activeTab = (m.activeTab + 1) % len(m.tabs)
+			m.rebuildTable()
+		}
+		return m, nil
+	case key.Matches(msg, importPickerKeys.shiftTab):
+		if len(m.tabs) > 1 {
+			m.activeTab = (m.activeTab - 1 + len(m.tabs)) % len(m.tabs)
+			m.rebuildTable()
+		}
+		return m, nil
 	case key.Matches(msg, importPickerKeys.confirm):
-		// Advance to params page rather than confirming. cursor reset so
-		// the user lands on the first toggle.
+		// Advance to params; cursor reset so the user lands on the
+		// first toggle.
 		m.page = pagePickParams
-		m.cursor = 0
+		m.paramCursor = 0
+		return m, nil
 	}
-	return m, nil
+
+	// Forward navigation (up/down/pgup/pgdn) to the table itself.
+	var cmd tea.Cmd
+	m.tbl, cmd = m.tbl.Update(msg)
+	return m, cmd
 }
 
 func (m importPickerModel) handleParamsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, importPickerKeys.up):
-		if m.cursor > 0 {
-			m.cursor--
+		if m.paramCursor > 0 {
+			m.paramCursor--
 		}
 	case key.Matches(msg, importPickerKeys.down):
-		if m.cursor < len(m.params)-1 {
-			m.cursor++
+		if m.paramCursor < len(m.params)-1 {
+			m.paramCursor++
 		}
 	case key.Matches(msg, importPickerKeys.toggle):
 		if len(m.params) > 0 {
-			m.params[m.cursor].on = !m.params[m.cursor].on
+			m.params[m.paramCursor].on = !m.params[m.paramCursor].on
 		}
 	case key.Matches(msg, importPickerKeys.back):
-		// Return to items page, restoring its cursor to the top.
+		// Return to items page.
 		m.page = pagePickItems
-		m.cursor = 0
 	case key.Matches(msg, importPickerKeys.confirm):
 		m.confirmed = true
 		return m, tea.Quit
@@ -300,92 +463,208 @@ func (m importPickerModel) View() string {
 	if m.confirmed || m.cancelled {
 		return ""
 	}
+	w := m.width
+	h := m.height
+	if w < 40 {
+		w = 40
+	}
+	if h < 6 {
+		h = 6
+	}
 	switch m.page {
 	case pagePickItems:
-		return m.viewItems()
+		return m.viewItems(w, h)
 	case pagePickParams:
-		return m.viewParams()
+		return m.viewParams(w, h)
 	}
 	return ""
 }
 
-func (m importPickerModel) viewItems() string {
-	var b strings.Builder
-	title := lipgloss.NewStyle().Bold(true).Render(
-		fmt.Sprintf("Import from %s", m.inputPath))
-	b.WriteString(title + "\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		"Step 1 of 2 — pick what to import") + "\n\n")
+// viewItems mirrors the export picker's table layout: title bar, header
+// metadata block, tabs, table, key bar. Same widths, same colours — the
+// goal is "indistinguishable from export at a glance".
+func (m importPickerModel) viewItems(w, h int) string {
+	title := titleBar.Render("◆ Diet › Import › Step 1 of 2 — pick what to import")
+	meta := m.viewHeaderMeta(w)
+	metaLines := strings.Count(meta, "\n") + 1
 
-	currentKind := itemKind(-1)
-	for i, it := range m.items {
-		if it.kind != currentKind {
-			currentKind = it.kind
-			label := "Collections"
-			if it.kind == itemKindSystem {
-				label = "System Entities"
-			}
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("39")).Bold(true).
-				Render("● "+label) + "\n")
-		}
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "▸ "
-		}
-		check := "[ ]"
-		if it.selected {
-			check = "[x]"
-		}
-		b.WriteString(fmt.Sprintf("  %s%s %s\n", cursor, check, it.name))
+	var tabs string
+	if len(m.tabs) > 1 {
+		tabs = m.renderTabs(w)
 	}
 
-	selCols := len(m.selected(itemKindCollection))
-	selSys := len(m.selected(itemKindSystem))
-	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		fmt.Sprintf("Selected: %d collections, %d system entity types", selCols, selSys),
-	))
-	b.WriteString("\n\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		"↑/↓ move  space toggle  a toggle-all  enter next  q cancel"))
-	return b.String()
+	keyBar := renderKeyBar(w-2,
+		[2]string{"↑↓", "move"},
+		[2]string{"space", "select"},
+		[2]string{"a", "all"},
+		[2]string{"tab", "next tab"},
+		[2]string{"enter", "next"},
+		[2]string{"q", "cancel"},
+	)
+
+	// Chrome lines: title(1) + meta(N) + blank(1) + tabs(0/2) + keybar(1)
+	chrome := 3 + metaLines
+	if tabs != "" {
+		chrome += 2
+	}
+	tblH := max(h-chrome, 3)
+	m.tbl.SetHeight(tblH)
+	tbl := lipgloss.NewStyle().Padding(0, 1).Render(m.tbl.View())
+
+	parts := []string{title, meta, ""}
+	if tabs != "" {
+		parts = append(parts, tabs, "")
+	}
+	parts = append(parts, tbl, lipgloss.NewStyle().Padding(0, 1).Render(keyBar))
+
+	return padToHeight(lipgloss.JoinVertical(lipgloss.Left, parts...), h)
 }
 
-func (m importPickerModel) viewParams() string {
-	var b strings.Builder
-	title := lipgloss.NewStyle().Bold(true).Render(
-		fmt.Sprintf("Import from %s", m.inputPath))
-	b.WriteString(title + "\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		"Step 2 of 2 — safety options (defaults are conservative)") + "\n\n")
-
-	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	for i, p := range m.params {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "▸ "
-		}
-		check := "[ ]"
-		if p.on {
-			check = "[x]"
-		}
-		// Mark non-default toggles so the user can spot at a glance
-		// when they've moved off the safe baseline.
-		marker := ""
-		if p.on != p.defaultOn {
-			marker = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(" *")
-		}
-		b.WriteString(fmt.Sprintf("  %s%s %s%s\n", cursor, check, p.label, marker))
-		b.WriteString(hint.Render(fmt.Sprintf("        %s", p.desc)) + "\n")
+// viewHeaderMeta is the k9s-style two-column block at the top of the
+// items page, mirroring the export picker. Shows where the archive came
+// from + selection summary.
+func (m importPickerModel) viewHeaderMeta(w int) string {
+	row := func(label, value string) string {
+		return headerLabelStyle.Render(fmt.Sprintf("%-9s", label)) + " " +
+			headerValueStyle.Render(value)
 	}
 
-	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		"* = changed from default") + "\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(
-		"↑/↓ move  space toggle  enter import  b back  q cancel"))
-	return b.String()
+	colCount, colSel := 0, 0
+	sysCount, sysSel := 0, 0
+	for _, it := range m.items {
+		if it.kind == itemKindCollection {
+			colCount++
+			if it.selected {
+				colSel++
+			}
+		} else {
+			sysCount++
+			if it.selected {
+				sysSel++
+			}
+		}
+	}
+
+	src := m.sourceURL
+	if src == "" {
+		src = "—"
+	}
+	dirVer := m.directusVersion
+	if dirVer == "" {
+		dirVer = "—"
+	}
+	exported := m.exportedAt
+	if exported == "" {
+		exported = "—"
+	}
+
+	leftRows := []string{
+		row("Archive", truncate(filepathBase(m.inputPath), max(w/2-12, 20))),
+		row("Source", truncate(src, max(w/2-12, 20))),
+		row("Exported", exported),
+	}
+	rightRows := []string{
+		row("Diet", version),
+		row("Directus", dirVer),
+		row("Selected", fmt.Sprintf("%d/%d cols, %d/%d sys", colSel, colCount, sysSel, sysCount)),
+	}
+
+	left := lipgloss.JoinVertical(lipgloss.Left, leftRows...)
+	right := lipgloss.JoinVertical(lipgloss.Left, rightRows...)
+	leftCol := lipgloss.NewStyle().Width(w / 2).Padding(0, 1).Render(left)
+	rightCol := lipgloss.NewStyle().Padding(0, 1).Render(right)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+}
+
+func (m importPickerModel) renderTabs(maxW int) string {
+	var parts []string
+	for i, t := range m.tabs {
+		count := 0
+		for _, it := range m.items {
+			if it.kind == t.kind {
+				count++
+			}
+		}
+		label := fmt.Sprintf("%s (%d)", t.label, count)
+		if i == m.activeTab {
+			parts = append(parts, activeTabStyle.Render(label))
+		} else {
+			parts = append(parts, inactiveTabStyle.Render(label))
+		}
+	}
+	line := strings.Join(parts, " ")
+	return lipgloss.NewStyle().Padding(0, 1).MaxWidth(maxW).Render(line)
+}
+
+// viewParams renders the safety-toggles page wrapped in the wizard's
+// rounded-border frame, centered on screen. Same visual language as
+// stepProfile / stepNewProfile so the user doesn't experience a jarring
+// style change between picker pages and wizard.
+func (m importPickerModel) viewParams(w, h int) string {
+	heading := lipgloss.NewStyle().Foreground(dimColor).
+		Render("Import · Step 2 of 2 — safety options (defaults are conservative)")
+
+	rows := make([]string, 0, len(m.params)*2)
+	for i, p := range m.params {
+		isCursor := i == m.paramCursor
+
+		var cursor, box string
+		if isCursor {
+			cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
+		} else {
+			cursor = "  "
+		}
+		if p.on {
+			box = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("[x]")
+		} else {
+			box = lipgloss.NewStyle().Foreground(dimColor).Render("[ ]")
+		}
+
+		labelStyle := lipgloss.NewStyle().Foreground(labelCol)
+		if isCursor {
+			labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+		}
+		marker := ""
+		if p.on != p.defaultOn {
+			marker = lipgloss.NewStyle().Foreground(warnColor).Bold(true).Render(" *")
+		}
+		descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
+
+		rows = append(rows,
+			cursor+box+" "+labelStyle.Render(p.label)+marker,
+			"      "+descStyle.Render(p.desc),
+		)
+	}
+
+	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
+	hints := renderKeyBar(72,
+		[2]string{"↑↓", "move"},
+		[2]string{"space", "toggle"},
+		[2]string{"enter", "import"},
+		[2]string{"b", "back"},
+		[2]string{"q", "cancel"},
+	)
+	legend := lipgloss.NewStyle().Foreground(dimColor).Italic(true).
+		Render("* = changed from default")
+	banner := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(borderColor).
+		Render("◆  D I E T")
+
+	inner := lipgloss.JoinVertical(lipgloss.Center,
+		banner,
+		"",
+		heading,
+		"",
+		lipgloss.NewStyle().Width(72).Render(body),
+		"",
+		legend,
+		"",
+		hints,
+	)
+
+	box := frameBorder.Padding(1, 4).Render(inner)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
 type importPickerKeyMap struct {
@@ -396,6 +675,8 @@ type importPickerKeyMap struct {
 	confirm   key.Binding
 	cancel    key.Binding
 	back      key.Binding
+	tab       key.Binding
+	shiftTab  key.Binding
 }
 
 var importPickerKeys = importPickerKeyMap{
@@ -406,4 +687,6 @@ var importPickerKeys = importPickerKeyMap{
 	confirm:   key.NewBinding(key.WithKeys("enter")),
 	cancel:    key.NewBinding(key.WithKeys("q", "esc", "ctrl+c")),
 	back:      key.NewBinding(key.WithKeys("b", "backspace", "left", "h")),
+	tab:       key.NewBinding(key.WithKeys("tab")),
+	shiftTab:  key.NewBinding(key.WithKeys("shift+tab")),
 }
