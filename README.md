@@ -117,6 +117,7 @@ diet diff
 | `--strip-accountability` | `false` | Set `meta.accountability=null` on every imported collection. Skips `directus_activity` (audit log) and `directus_revisions` writes during data import — roughly halves the data-phase time on Directus's side. Reversible after import via the admin UI (collection settings → Activity & Revisions Tracking). |
 | `--db-dsn` | `""` | **UNSAFE — local/CI/manual pipelines only.** Postgres DSN. When set, items are loaded straight into Postgres via the `COPY` protocol, bypassing the Directus REST API. Schema still goes through Directus. Skips ACL, hooks, cache invalidation. ~4× faster than the REST path. On connection or COPY failure, falls back to REST automatically with a warning. |
 | `--data` | `true` | Also import item data. Set `--data=false` for schema-only. |
+| `--strict` | `false` | Exit non-zero on any partial failure (data items lost, system entities failed). Off by default — historical "log and continue" stance preserved for existing pipelines. CI jobs that need to detect silent breakage should turn it on. Even without `--strict`, a catastrophic outcome (0 of N data items inserted) is always reported as an error. |
 
 The same tuning fields are persisted per-profile in `~/.config/diet/config.yml` via the wizard:
 
