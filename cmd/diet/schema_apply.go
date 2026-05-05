@@ -53,7 +53,15 @@ func schemaApplyBulk(client *apiClient, schema SchemaBundle, log func(string)) e
 		return classifySchemaError("schema/diff", status, body)
 	}
 
-	// 4. Extract `data` envelope and POST to /schema/apply.
+	// 4. Extract `data` envelope and strip destructive ops before applying.
+	//
+	// Why: /schema/diff returns the full delta required to make the target
+	// equal to the snapshot. For a partial archive (subset of source schema)
+	// that delta includes DROP COLLECTION / DROP FIELD / DROP RELATION
+	// entries for everything in target that's missing from the snapshot —
+	// applying it verbatim wipes data the user never asked us to touch.
+	// Import is intentionally additive: we only ever create or update
+	// objects mentioned in the archive, never remove anything else.
 	var diffEnv struct {
 		Data json.RawMessage `json:"data"`
 	}
@@ -65,7 +73,20 @@ func schemaApplyBulk(client *apiClient, schema SchemaBundle, log func(string)) e
 		return nil
 	}
 
-	respBody, status, err := client.post("/schema/apply", diffEnv.Data)
+	additive, dropped, err := stripDestructiveDiff(diffEnv.Data)
+	if err != nil {
+		return fmt.Errorf("schema/diff: filter destructive ops: %w", err)
+	}
+	if dropped.total() > 0 {
+		log(fmt.Sprintf("Schema: filtered %d destructive ops from diff (%d collections, %d fields, %d relations would have been dropped)",
+			dropped.total(), dropped.collections, dropped.fields, dropped.relations))
+	}
+	if additive == nil {
+		log("Schema: nothing to apply after filtering destructive ops (target already has everything in archive)")
+		return nil
+	}
+
+	respBody, status, err := client.post("/schema/apply", additive)
 	if err != nil {
 		return fmt.Errorf("schema/apply: %w", err)
 	}
@@ -76,6 +97,165 @@ func schemaApplyBulk(client *apiClient, schema SchemaBundle, log func(string)) e
 	log(fmt.Sprintf("Schema: applied %d collections, %d fields, %d relations in one shot",
 		len(schema.Collections), len(schema.Fields), len(schema.Relations)))
 	return nil
+}
+
+// destructiveCounts reports what we filtered out of a /schema/diff response.
+// All three numbers count entries (collection rows, field rows, relation
+// rows) where every inner diff op was destructive — partial filtering of an
+// inner array still counts the entry as kept.
+type destructiveCounts struct {
+	collections int
+	fields      int
+	relations   int
+}
+
+func (d destructiveCounts) total() int { return d.collections + d.fields + d.relations }
+
+// stripDestructiveDiff parses the `data` payload of /schema/diff (shape:
+// {hash, diff: {collections, fields, relations}}) and removes every inner
+// op with kind == "D". It also drops top-level entries whose inner diff
+// array becomes empty after filtering.
+//
+// Returns the rewritten payload as json.RawMessage suitable for POSTing to
+// /schema/apply, or nil if no additive ops remain. The hash is preserved
+// verbatim — Directus uses it as a concurrency check against current
+// target state, which we never mutated.
+//
+// We thread the JSON through map[string]json.RawMessage rather than typed
+// structs so any future Directus deepdiff fields (lhs/rhs/path/index/item,
+// or new top-level diff sections) ride through unchanged. We only inspect
+// `kind` on the leaf ops — that's the contract we need.
+func stripDestructiveDiff(raw json.RawMessage) (json.RawMessage, destructiveCounts, error) {
+	var counts destructiveCounts
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, counts, err
+	}
+	diffRaw, ok := env["diff"]
+	if !ok {
+		return raw, counts, nil // unrecognized shape, pass through
+	}
+	var diffMap map[string]json.RawMessage
+	if err := json.Unmarshal(diffRaw, &diffMap); err != nil {
+		return nil, counts, err
+	}
+
+	type section struct {
+		key string
+		ptr *int
+	}
+	for _, sec := range []section{
+		{"collections", &counts.collections},
+		{"fields", &counts.fields},
+		{"relations", &counts.relations},
+	} {
+		raw, ok := diffMap[sec.key]
+		if !ok {
+			continue
+		}
+		var entries []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, counts, fmt.Errorf("parse %s: %w", sec.key, err)
+		}
+		filtered, dropped := filterDiffEntries(entries)
+		*sec.ptr = dropped
+		newRaw, err := json.Marshal(filtered)
+		if err != nil {
+			return nil, counts, err
+		}
+		diffMap[sec.key] = newRaw
+	}
+
+	// If every known section is empty after filtering, signal "nothing to
+	// apply" by returning nil. We deliberately consider only the three
+	// known sections — an unrecognized section we forwarded as-is should
+	// also count as "something to apply".
+	if isEmptyDiffSection(diffMap, "collections") &&
+		isEmptyDiffSection(diffMap, "fields") &&
+		isEmptyDiffSection(diffMap, "relations") &&
+		!hasUnknownSections(diffMap) {
+		return nil, counts, nil
+	}
+
+	newDiff, err := json.Marshal(diffMap)
+	if err != nil {
+		return nil, counts, err
+	}
+	env["diff"] = newDiff
+	out, err := json.Marshal(env)
+	if err != nil {
+		return nil, counts, err
+	}
+	return out, counts, nil
+}
+
+func isEmptyDiffSection(m map[string]json.RawMessage, key string) bool {
+	raw, ok := m[key]
+	if !ok {
+		return true
+	}
+	// Match `[]` (after trimming whitespace) or `null`.
+	s := strings.TrimSpace(string(raw))
+	return s == "[]" || s == "null"
+}
+
+func hasUnknownSections(m map[string]json.RawMessage) bool {
+	for k := range m {
+		switch k {
+		case "collections", "fields", "relations":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// filterDiffEntries strips inner ops with kind=="D" from each entry and
+// drops entries whose inner `diff` array is empty afterwards. Returns the
+// surviving entries plus a count of fully-dropped entries (i.e. entries
+// where every inner op was destructive).
+func filterDiffEntries(entries []map[string]json.RawMessage) ([]map[string]json.RawMessage, int) {
+	dropped := 0
+	out := entries[:0]
+	for _, ent := range entries {
+		innerRaw, ok := ent["diff"]
+		if !ok {
+			out = append(out, ent)
+			continue
+		}
+		var inner []json.RawMessage
+		if err := json.Unmarshal(innerRaw, &inner); err != nil {
+			// Unrecognized shape — keep as-is rather than risk dropping
+			// a non-destructive op we didn't understand.
+			out = append(out, ent)
+			continue
+		}
+		kept := inner[:0]
+		for _, op := range inner {
+			var head struct {
+				Kind string `json:"kind"`
+			}
+			if err := json.Unmarshal(op, &head); err == nil && head.Kind == "D" {
+				continue
+			}
+			kept = append(kept, op)
+		}
+		if len(kept) == 0 {
+			dropped++
+			continue
+		}
+		newInner, err := json.Marshal(kept)
+		if err != nil {
+			// Marshal of []RawMessage shouldn't fail; if it somehow does
+			// keep the original entry to err on the side of preservation.
+			out = append(out, ent)
+			continue
+		}
+		ent["diff"] = newInner
+		out = append(out, ent)
+	}
+	return out, dropped
 }
 
 // snapshotMeta describes the target's schema-snapshot envelope. Directus

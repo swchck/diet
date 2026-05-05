@@ -209,8 +209,8 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 	// single bottom-line and decide whether --strict should turn this
 	// into a non-zero exit.
 	var (
-		dataInserted, dataTotal int
-		sysInserted, sysFailed  int
+		dataInserted, dataTotal             int
+		sysInserted, sysSkipped, sysFailed  int
 	)
 
 	if opts.Data && len(data) > 0 {
@@ -261,10 +261,16 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 			if !ok {
 				continue
 			}
-			ins, fail := insertSystemItems(client, entity.Endpoint, items)
-			sysInserted += ins
-			sysFailed += fail
-			logFn(fmt.Sprintf("System %s: %d inserted, %d failed", name, ins, fail))
+			res := insertSystemItems(client, entity.Endpoint, items)
+			sysInserted += res.Inserted
+			sysSkipped += res.Skipped
+			sysFailed += res.Failed
+			if res.Skipped > 0 {
+				logFn(fmt.Sprintf("System %s: %d inserted, %d skipped (already present), %d failed",
+					name, res.Inserted, res.Skipped, res.Failed))
+			} else {
+				logFn(fmt.Sprintf("System %s: %d inserted, %d failed", name, res.Inserted, res.Failed))
+			}
 			tracker.advance()
 		}
 	}

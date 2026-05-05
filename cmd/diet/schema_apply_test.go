@@ -236,6 +236,188 @@ func TestSchemaApplyBulk_PayloadTooLargeReturnsActionableError(t *testing.T) {
 	}
 }
 
+// TestStripDestructiveDiff covers the "additive import" filter that protects
+// users from accidentally wiping target collections when importing a partial
+// archive. Directus's /schema/diff?force=true returns the full delta needed
+// to make target == snapshot, which for a subset archive includes drops for
+// every non-archive collection / field / relation. We must strip those.
+func TestStripDestructiveDiff_DropsDeletesAndKeepsAdds(t *testing.T) {
+	in := json.RawMessage(`{
+		"hash": "h1",
+		"diff": {
+			"collections": [
+				{"collection":"to_drop","diff":[{"kind":"D","lhs":{"x":1}}]},
+				{"collection":"to_create","diff":[{"kind":"N","rhs":{"x":2}}]},
+				{"collection":"mixed","diff":[
+					{"kind":"D","path":["a"]},
+					{"kind":"E","path":["b"],"lhs":1,"rhs":2}
+				]}
+			],
+			"fields": [
+				{"collection":"directus_users","field":"custom_field","diff":[{"kind":"D"}]}
+			],
+			"relations": []
+		}
+	}`)
+	out, counts, err := stripDestructiveDiff(in)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if counts.collections != 1 {
+		t.Errorf("collections fully-dropped = %d, want 1 (to_drop)", counts.collections)
+	}
+	if counts.fields != 1 {
+		t.Errorf("fields fully-dropped = %d, want 1", counts.fields)
+	}
+	// Re-parse output and verify shape.
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["hash"] != "h1" {
+		t.Errorf("hash lost: %v", got["hash"])
+	}
+	diff := got["diff"].(map[string]any)
+	cols := diff["collections"].([]any)
+	if len(cols) != 2 {
+		t.Fatalf("collections kept = %d, want 2 (to_create + mixed)", len(cols))
+	}
+	// `mixed` should have only its E op left.
+	for _, c := range cols {
+		cm := c.(map[string]any)
+		if cm["collection"] == "mixed" {
+			ops := cm["diff"].([]any)
+			if len(ops) != 1 {
+				t.Errorf("mixed: ops kept = %d, want 1", len(ops))
+			}
+			if ops[0].(map[string]any)["kind"] != "E" {
+				t.Errorf("mixed: surviving op kind = %v, want E", ops[0].(map[string]any)["kind"])
+			}
+		}
+	}
+}
+
+func TestStripDestructiveDiff_AllDeletesYieldsNil(t *testing.T) {
+	in := json.RawMessage(`{
+		"hash": "h",
+		"diff": {
+			"collections": [{"collection":"x","diff":[{"kind":"D"}]}],
+			"fields": [],
+			"relations": []
+		}
+	}`)
+	out, counts, err := stripDestructiveDiff(in)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if out != nil {
+		t.Errorf("expected nil out (nothing to apply), got %s", out)
+	}
+	if counts.collections != 1 {
+		t.Errorf("collections counted = %d, want 1", counts.collections)
+	}
+}
+
+// TestStripDestructiveDiff_PreservesUnknownSections — Directus may add new
+// diff sections in future versions; we shouldn't silently drop them.
+func TestStripDestructiveDiff_PreservesUnknownSections(t *testing.T) {
+	in := json.RawMessage(`{
+		"hash": "h",
+		"diff": {
+			"collections": [],
+			"future_thing": [{"id":1}]
+		}
+	}`)
+	out, _, err := stripDestructiveDiff(in)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if out == nil {
+		t.Fatal("unknown section should keep payload non-nil")
+	}
+	if !strings.Contains(string(out), "future_thing") {
+		t.Errorf("unknown section dropped: %s", out)
+	}
+}
+
+// TestSchemaApplyBulk_FiltersDestructiveOps covers the integration: when
+// /schema/diff returns destructive ops, /schema/apply must receive a
+// filtered body. This is the regression guard for "partial archive wiped
+// the target".
+func TestSchemaApplyBulk_FiltersDestructiveOps(t *testing.T) {
+	var applyBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/schema/snapshot":
+			w.Write([]byte(`{"data":{"version":1,"directus":"11.17.0","vendor":"postgres","collections":[],"fields":[],"relations":[]}}`))
+		case r.Method == "POST" && r.URL.Path == "/schema/diff":
+			// Mix of N (new) and D (destroy) — only N should reach apply.
+			w.Write([]byte(`{"data":{"hash":"h","diff":{"collections":[
+				{"collection":"new_col","diff":[{"kind":"N","rhs":{"collection":"new_col"}}]},
+				{"collection":"old_col_to_keep","diff":[{"kind":"D","lhs":{"collection":"old_col_to_keep"}}]}
+			],"fields":[],"relations":[]}}}`))
+		case r.Method == "POST" && r.URL.Path == "/schema/apply":
+			buf := make([]byte, 4096)
+			n, _ := r.Body.Read(buf)
+			applyBody = string(buf[:n])
+			w.WriteHeader(204)
+		default:
+			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	bundle := SchemaBundle{
+		Collections: []CollectionInfo{{Collection: "new_col", Schema: json.RawMessage(`{"name":"new_col"}`), Meta: json.RawMessage(`{}`)}},
+	}
+	var logs []string
+	if err := schemaApplyBulk(c, bundle, func(s string) { logs = append(logs, s) }); err != nil {
+		t.Fatalf("schemaApplyBulk: %v", err)
+	}
+	if applyBody == "" {
+		t.Fatal("apply was not called")
+	}
+	if strings.Contains(applyBody, "old_col_to_keep") {
+		t.Errorf("destructive op for old_col_to_keep leaked into apply body: %s", applyBody)
+	}
+	if !strings.Contains(applyBody, "new_col") {
+		t.Errorf("apply body missing additive op for new_col: %s", applyBody)
+	}
+	if !anyContains(logs, "filtered") {
+		t.Errorf("expected log mentioning filtered ops, got %v", logs)
+	}
+}
+
+// TestSchemaApplyBulk_AllDestructiveSkipsApply — when every op is destructive
+// (e.g. archive contains only collections target already has), we must NOT
+// call /schema/apply at all. Calling it with empty ops would be a no-op but
+// still wastes a round-trip.
+func TestSchemaApplyBulk_AllDestructiveSkipsApply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/schema/snapshot":
+			w.Write([]byte(`{"data":{"version":1,"directus":"11.17.0","vendor":"postgres"}}`))
+		case "/schema/diff":
+			w.Write([]byte(`{"data":{"hash":"h","diff":{"collections":[
+				{"collection":"x","diff":[{"kind":"D"}]}
+			],"fields":[],"relations":[]}}}`))
+		case "/schema/apply":
+			t.Error("apply should not be called when every op is destructive")
+		}
+	}))
+	defer srv.Close()
+	c := newClient(srv.URL, "tok")
+	var logs []string
+	if err := schemaApplyBulk(c, SchemaBundle{}, func(s string) { logs = append(logs, s) }); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !anyContains(logs, "nothing to apply") {
+		t.Errorf("expected log mentioning nothing-to-apply, got %v", logs)
+	}
+}
+
 func TestSchemaApplyBulk_EmptyDiffIsSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

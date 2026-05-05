@@ -154,18 +154,103 @@ func fetchAllSystemEntities(client *apiClient, userColSet map[string]bool, log f
 
 // Insert (import)
 
-func insertSystemItems(client *apiClient, endpoint string, items []json.RawMessage) (int, int) {
-	var inserted, failed atomic.Int64
+// systemInsertOutcome separates the three categories we care about for
+// system-entity POSTs: items that landed, items that already exist on the
+// target (treated as "leave the existing value alone" — see classify-
+// SystemPostError), and items that failed for any other reason.
+//
+// Skipped is reported separately from failed so partial-failure exit codes
+// (--strict) and progress messages don't conflate "user already exists"
+// with "Directus rejected the payload".
+type systemInsertOutcome struct {
+	Inserted int
+	Skipped  int
+	Failed   int
+}
+
+// insertSystemItems posts each item to `endpoint`, classifying the response
+// as inserted, skipped (already present — unique constraint hit on id /
+// email / etc.), or failed. We do not attempt PATCH-on-conflict: a target
+// that already has a record with the same id/email is assumed to be the
+// user's intent ("don't overwrite what's already there").
+func insertSystemItems(client *apiClient, endpoint string, items []json.RawMessage) systemInsertOutcome {
+	var inserted, skipped, failed atomic.Int64
 	_ = runParallel(client, items, func(item json.RawMessage) error {
-		_, status, _ := client.post(endpoint, item)
-		if status >= 200 && status < 300 {
+		body, status, _ := client.post(endpoint, item)
+		switch classifySystemPostResult(status, body) {
+		case sysResultInserted:
 			inserted.Add(1)
-		} else {
+		case sysResultDuplicate:
+			skipped.Add(1)
+		default:
 			failed.Add(1)
 		}
 		return nil
 	})
-	return int(inserted.Load()), int(failed.Load())
+	return systemInsertOutcome{
+		Inserted: int(inserted.Load()),
+		Skipped:  int(skipped.Load()),
+		Failed:   int(failed.Load()),
+	}
+}
+
+// systemPostResult is the trichotomy we want for system-entity POSTs.
+// Pulled out so the classification policy is unit-testable independently
+// of the network plumbing.
+type systemPostResult int
+
+const (
+	sysResultInserted systemPostResult = iota
+	sysResultDuplicate
+	sysResultOther // generic failure
+)
+
+// classifySystemPostResult maps an HTTP status + response body from a
+// system-entity POST to one of three outcomes.
+//
+// "Duplicate" is the case the user explicitly asked to swallow silently:
+// the target already has a record with this id / email / unique key, and
+// we should leave it alone rather than error. Directus signals this with
+// `extensions.code == "RECORD_NOT_UNIQUE"` (for both PK collisions and
+// secondary unique constraints like users.email).
+//
+// We deliberately don't trust HTTP status alone — Directus uses 400 for
+// many distinct error codes, and false-positive "skip" on a real
+// validation error would silently lose data.
+func classifySystemPostResult(status int, body []byte) systemPostResult {
+	if status >= 200 && status < 300 {
+		return sysResultInserted
+	}
+	if containsErrorCode(body, "RECORD_NOT_UNIQUE") {
+		return sysResultDuplicate
+	}
+	return sysResultOther
+}
+
+// containsErrorCode looks for a Directus error envelope with the given
+// extensions.code. Directus errors look like:
+//
+//	{"errors":[{"message":"...","extensions":{"code":"RECORD_NOT_UNIQUE",...}}]}
+//
+// We parse minimally — enough to catch the code without risking a panic
+// on shape drift across Directus versions.
+func containsErrorCode(body []byte, code string) bool {
+	var env struct {
+		Errors []struct {
+			Extensions struct {
+				Code string `json:"code"`
+			} `json:"extensions"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return false
+	}
+	for _, e := range env.Errors {
+		if e.Extensions.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // Delete (clean)
