@@ -900,12 +900,34 @@ func runWizard() error {
 				return nil
 			}
 		}
+		// Hand off to the import picker for items + safety params.
+		// This is the same TUI the user sees with `diet import --pick`,
+		// reused here so the wizard flow gets the same conservative
+		// defaults (no-folders ON, etc.) without needing a separate
+		// implementation.
+		picked, err := runImportPicker(res.inputFile)
+		if err != nil {
+			return err
+		}
+		if picked == nil {
+			fmt.Println("Cancelled.")
+			return nil
+		}
 		client := newClientWithOptions(res.targetProf.URL, res.targetProf.Token, res.targetProf.clientOptions())
 		if err := executeImport(client, res.inputFile, importOpts{
-			Data:                true,
-			UseTUI:              true,
-			BulkSchema:          true,
-			StripAccountability: res.stripAccountability,
+			Data: !picked.options.SkipData,
+			// Wizard owns the progress TUI itself, so pass UseTUI so
+			// the importer renders its progress bar / live log.
+			UseTUI:     true,
+			BulkSchema: true,
+			// Picker's strip-accountability toggle wins over the
+			// wizard's legacy options screen — the picker page is
+			// the more recent edit, plus it's what the user just
+			// confirmed.
+			StripAccountability: picked.options.StripAccountability || res.stripAccountability,
+			Collections:         picked.collections,
+			SystemEntities:      picked.systemEntities,
+			NoFolders:           picked.options.NoFolders,
 		}); err != nil {
 			return err
 		}
