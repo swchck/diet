@@ -128,21 +128,17 @@ type wizardResult struct {
 	inputFile   string  // for import: archive path
 	profileName string
 	cancelled   bool
-
-	// Per-import toggles surfaced in stepImportOptions.
-	stripAccountability bool
 }
 
 // Wizard steps
 
 const (
-	stepOperation     = iota
-	stepProfile       // select server profile
-	stepNewProfile    // create new profile (name + url + token + settings)
-	stepImportFile    // import: enter archive path
-	stepImportTarget  // import: select target profile
-	stepNewTarget     // import: create new target profile
-	stepImportOptions // import: per-run toggles (strip accountability, ...)
+	stepOperation    = iota
+	stepProfile      // select server profile
+	stepNewProfile   // create new profile (name + url + token + settings)
+	stepImportFile   // import: enter archive path
+	stepImportTarget // import: select target profile
+	stepNewTarget    // import: create new target profile
 )
 
 // Wizard model
@@ -168,10 +164,6 @@ type wizardModel struct {
 	selectedProfile string
 	selectedTarget  string
 	inputFile       string
-
-	// Step: import options (stepImportOptions)
-	importOptionIdx     int  // currently focused option row
-	stripAccountability bool // toggle 1
 
 	done      bool
 	cancelled bool
@@ -278,52 +270,6 @@ func (m wizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleNewProfileKey(msg)
 	case stepImportFile:
 		return m.handleFileKey(msg)
-	case stepImportOptions:
-		return m.handleImportOptionsKey(msg)
-	}
-	return m, nil
-}
-
-// importOptions is the canonical list of toggles the user can flip on the
-// stepImportOptions screen. Adding a new option here automatically renders
-// it in viewImportOptionsStep and tracks toggle state via getter/setter.
-var importOptions = []struct {
-	label string
-	desc  string
-	get   func(*wizardModel) bool
-	set   func(*wizardModel, bool)
-}{
-	{
-		label: "Strip accountability",
-		desc:  "skip activity + revisions logging — much faster, audit log empty",
-		get:   func(m *wizardModel) bool { return m.stripAccountability },
-		set:   func(m *wizardModel, v bool) { m.stripAccountability = v },
-	},
-}
-
-func (m wizardModel) handleImportOptionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "up", "k":
-		if m.importOptionIdx > 0 {
-			m.importOptionIdx--
-		}
-	case "down", "j":
-		if m.importOptionIdx < len(importOptions)-1 {
-			m.importOptionIdx++
-		}
-	case " ", "x":
-		opt := importOptions[m.importOptionIdx]
-		opt.set(&m, !opt.get(&m))
-	case "enter":
-		m.done = true
-		return m, tea.Quit
-	case "esc":
-		// Step back to target selection.
-		m.goToProfileSelect(stepImportTarget)
-		return m, nil
-	case "q":
-		m.cancelled = true
-		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -395,9 +341,11 @@ func (m wizardModel) handleProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			name := m.profileNames[m.profileIdx]
 			if m.step == stepImportTarget {
 				m.selectedTarget = name
-				m.step = stepImportOptions
-				m.importOptionIdx = 0
-				return m, nil
+				// Target picked — wizard is done; the dispatch
+				// then runs runImportPicker for items + safety
+				// params before kicking off the import.
+				m.done = true
+				return m, tea.Quit
 			}
 			m.selectedProfile = name
 			m.done = true
@@ -427,12 +375,8 @@ func (m wizardModel) handleNewProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.validateRequired() {
 			m.saveNewProfile()
-			// New target for import → go to options screen instead of quitting.
-			if m.step == stepNewTarget {
-				m.step = stepImportOptions
-				m.importOptionIdx = 0
-				return m, nil
-			}
+			// New target for import → wizard done; dispatch runs
+			// runImportPicker next for items + safety params.
 			m.done = true
 			return m, tea.Quit
 		}
@@ -533,11 +477,10 @@ func (m *wizardModel) saveNewProfile() {
 
 func (m wizardModel) result() wizardResult {
 	res := wizardResult{
-		operation:           strings.ToLower(m.operations[m.operation]),
-		profileName:         m.selectedProfile,
-		inputFile:           m.inputFile,
-		cancelled:           m.cancelled,
-		stripAccountability: m.stripAccountability,
+		operation:   strings.ToLower(m.operations[m.operation]),
+		profileName: m.selectedProfile,
+		inputFile:   m.inputFile,
+		cancelled:   m.cancelled,
 	}
 	if m.selectedProfile != "" {
 		res.prof = m.cfg.Profiles[m.selectedProfile]
@@ -572,11 +515,6 @@ func (m wizardModel) wizardHints() string {
 		return renderKeyHint("tab", "next field") + "   " +
 			renderKeyHint("enter", "confirm") + "   " +
 			renderKeyHint("esc", "back")
-	case stepImportOptions:
-		return renderKeyHint("↑↓", "select") + "   " +
-			renderKeyHint("space", "toggle") + "   " +
-			renderKeyHint("enter", "start import") + "   " +
-			renderKeyHint("esc", "back")
 	default:
 		return renderKeyHint("↑↓", "select") + "   " +
 			renderKeyHint("enter", "confirm") + "   " +
@@ -602,8 +540,6 @@ func (m wizardModel) View() string {
 		body = m.viewInputStep()
 	case stepImportFile:
 		body = m.viewInputStep()
-	case stepImportOptions:
-		body = m.viewImportOptionsStep()
 	}
 
 	box := lipgloss.NewStyle().
@@ -630,8 +566,6 @@ func (m wizardModel) stepLabel() string {
 		return "Import · new target profile"
 	case stepImportFile:
 		return "Import · archive path"
-	case stepImportOptions:
-		return "Import · options"
 	}
 	return ""
 }
@@ -738,52 +672,6 @@ func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) stri
 		heading,
 		"",
 		lipgloss.NewStyle().Width(56).Render(body),
-		"",
-		m.wizardHints(),
-	)
-}
-
-// viewImportOptionsStep renders the per-import toggle list. Currently one
-// row (strip-accountability); the importOptions slice is the extension
-// point — adding an entry there auto-renders here.
-func (m wizardModel) viewImportOptionsStep() string {
-	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
-
-	rows := make([]string, 0, len(importOptions))
-	for i, opt := range importOptions {
-		isCursor := i == m.importOptionIdx
-		on := opt.get(&m)
-
-		var cursor, box string
-		switch {
-		case isCursor:
-			cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
-		default:
-			cursor = "  "
-		}
-		if on {
-			box = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("[x]")
-		} else {
-			box = lipgloss.NewStyle().Foreground(dimColor).Render("[ ]")
-		}
-
-		labelStyle := lipgloss.NewStyle().Foreground(labelCol)
-		if isCursor {
-			labelStyle = labelStyle.Foreground(valueCol).Bold(true)
-		}
-		descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
-
-		row := cursor + box + " " + labelStyle.Render(opt.label) + "  " + descStyle.Render(opt.desc)
-		rows = append(rows, row)
-	}
-
-	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(72).Render(body),
 		"",
 		m.wizardHints(),
 	)
@@ -920,11 +808,10 @@ func runWizard() error {
 			// the importer renders its progress bar / live log.
 			UseTUI:     true,
 			BulkSchema: true,
-			// Picker's strip-accountability toggle wins over the
-			// wizard's legacy options screen — the picker page is
-			// the more recent edit, plus it's what the user just
-			// confirmed.
-			StripAccountability: picked.options.StripAccountability || res.stripAccountability,
+			// Strip-accountability is now exclusively driven by the
+			// picker's params page; the wizard's legacy options
+			// screen was removed when the picker took over the role.
+			StripAccountability: picked.options.StripAccountability,
 			Collections:         picked.collections,
 			SystemEntities:      picked.systemEntities,
 			NoFolders:           picked.options.NoFolders,
