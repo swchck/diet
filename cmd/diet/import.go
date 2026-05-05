@@ -25,6 +25,9 @@ func newImportCmd() *cobra.Command {
 	cmd.Flags().Bool("strip-accountability", false, "Set meta.accountability=null on imported collections (skip activity + revisions logging — ~2-3× faster data import)")
 	cmd.Flags().String("db-dsn", "", "Postgres DSN for direct COPY-protocol data load, bypassing the Directus REST API (e.g. postgres://user:pass@host:5432/db?sslmode=disable). Schema still goes through Directus. UNSAFE: skips ACL/hooks/cache — local/CI/manual pipelines only.")
 	cmd.Flags().Bool("strict", false, "Exit non-zero if any data row or system entity failed to import. By default partial failures are logged but the command exits 0 (legacy behavior). CI/automation should set --strict to detect silent breakage.")
+	cmd.Flags().StringSlice("collections", nil, "Comma-separated user collections to import from the archive (default: all). Relations crossing the boundary are dropped with a warning.")
+	cmd.Flags().StringSlice("system-entities", nil, "Comma-separated system entity types to import (flows, dashboards, roles, users, translations, webhooks, operations, panels, presets). Default: all entity types present in the archive.")
+	cmd.Flags().Bool("pick", false, "Open an interactive picker to choose collections and system entities from the archive before importing. Mutually exclusive with --collections / --system-entities / --plain.")
 	_ = cmd.MarkFlagRequired("input")
 	_ = cmd.MarkFlagRequired("target-url")
 	_ = cmd.MarkFlagRequired("target-token")
@@ -42,19 +45,41 @@ func runImport(cmd *cobra.Command, args []string) error {
 	stripAcc, _ := cmd.Flags().GetBool("strip-accountability")
 	dbDSN, _ := cmd.Flags().GetString("db-dsn")
 	strict, _ := cmd.Flags().GetBool("strict")
+	collectionsFilter, _ := cmd.Flags().GetStringSlice("collections")
+	systemEntitiesFilter, _ := cmd.Flags().GetStringSlice("system-entities")
+	pick, _ := cmd.Flags().GetBool("pick")
 	plain, _ := cmd.Flags().GetBool("plain")
+
+	if pick && (len(collectionsFilter) > 0 || len(systemEntitiesFilter) > 0 || plain) {
+		return fmt.Errorf("--pick is mutually exclusive with --collections, --system-entities, --plain")
+	}
 
 	client := newClientWithOptions(targetURL, targetToken, clientOptionsFromFlags(cmd))
 	client.email = email
 	client.password = password
 
+	if pick {
+		picked, err := runImportPicker(input)
+		if err != nil {
+			return err
+		}
+		if picked == nil {
+			fmt.Println("Cancelled.")
+			return nil
+		}
+		collectionsFilter = picked.collections
+		systemEntitiesFilter = picked.systemEntities
+	}
+
 	return executeImport(client, input, importOpts{
 		Data:                importData,
-		UseTUI:              !plain,
+		UseTUI:              !plain && !pick,
 		BulkSchema:          bulkSchema,
 		StripAccountability: stripAcc,
 		DBDSN:               dbDSN,
 		Strict:              strict,
+		Collections:         collectionsFilter,
+		SystemEntities:      systemEntitiesFilter,
 	})
 }
 
@@ -75,6 +100,15 @@ type importOpts struct {
 	// existing pipelines treat a few FK-orphan rows as expected. CI
 	// jobs that care about exact item counts should turn it on.
 	Strict bool
+	// Collections, when non-empty, restricts the import to the named
+	// user collections plus their direct dependencies. Relations and
+	// data referencing dropped collections are filtered out before
+	// import. Empty = no filter (legacy behavior, import everything).
+	Collections []string
+	// SystemEntities, when non-empty, restricts the import to the
+	// named system entity types ("flows", "dashboards", ...). Empty =
+	// no filter.
+	SystemEntities []string
 }
 
 func executeImport(client *apiClient, inputFile string, opts importOpts) error {
@@ -82,6 +116,24 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 	manifest, schema, data, systemData, err := extractArchive(inputFile)
 	if err != nil {
 		return fmt.Errorf("extract archive: %w", err)
+	}
+
+	if len(opts.Collections) > 0 {
+		var report filterReport
+		manifest, schema, data, report = filterArchiveSubset(manifest, schema, data, opts.Collections)
+		if len(report.missingFromKeep) > 0 {
+			return fmt.Errorf("--collections: not in archive: %v (available: %v)",
+				report.missingFromKeep, manifest.Collections)
+		}
+		fmt.Printf("  Filter: %d collections kept; dropped %d cross-boundary relations, %d orphaned system fields\n",
+			len(manifest.Collections), report.droppedRelations, report.droppedSystemFields)
+		if len(manifest.Collections) == 0 {
+			return fmt.Errorf("--collections produced empty selection — refusing to send empty schema/data to target")
+		}
+	}
+	if len(opts.SystemEntities) > 0 {
+		manifest, systemData = filterSystemSubset(manifest, systemData, opts.SystemEntities)
+		fmt.Printf("  Filter: %d system entity types kept\n", len(systemData))
 	}
 
 	fmt.Printf("  Source: %s (Directus %s)\n", manifest.SourceURL, manifest.DirectusVersion)
