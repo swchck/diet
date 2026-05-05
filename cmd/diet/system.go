@@ -250,7 +250,34 @@ func extractSystemItemStatus(item json.RawMessage) string {
 	return "—"
 }
 
-// stripSensitiveFields removes passwords, tokens, and other secrets from user items.
+// sensitiveUserFields lists every directus_users column we strip on
+// export. Each entry is documented so future readers know whether to
+// keep / remove / extend the list.
+//
+//   - password           bcrypt hash; arguably reusable across instances
+//                        but treating it as a secret is the safer default.
+//   - token              static API token tied to the user; full bearer
+//                        access if leaked.
+//   - tfa_secret         TOTP shared secret; reproduces the user's 2FA
+//                        codes verbatim if leaked. Strict secret.
+//   - auth_data          SSO/OAuth refresh material for external IdPs.
+//                        Strict secret.
+//   - last_access        timestamp telemetry — not a secret, but
+//                        instance-scoped and not meaningful on the
+//                        target. Stripping keeps imports deterministic.
+//   - last_page          last admin-UI route the user opened —
+//                        instance-scoped and not meaningful.
+//
+// `email`, `external_identifier`, `provider`, `role` are kept: they're
+// identifiers/metadata the target needs to know who the user is.
+var sensitiveUserFields = []string{
+	"password", "token", "tfa_secret", "auth_data",
+	"last_access", "last_page",
+}
+
+// stripSensitiveFields removes passwords, tokens, and other secrets from
+// user items at export time. See sensitiveUserFields for the full list +
+// rationale per field.
 func stripSensitiveFields(entityType string, item json.RawMessage) json.RawMessage {
 	if entityType != "users" {
 		return item
@@ -259,7 +286,7 @@ func stripSensitiveFields(entityType string, item json.RawMessage) json.RawMessa
 	if json.Unmarshal(item, &obj) != nil {
 		return item
 	}
-	for _, field := range []string{"password", "token", "last_access", "last_page"} {
+	for _, field := range sensitiveUserFields {
 		delete(obj, field)
 	}
 	out, _ := json.Marshal(obj)

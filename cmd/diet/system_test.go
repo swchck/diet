@@ -155,7 +155,13 @@ func TestExtractSystemItemLabel_UserFirstNameOnly(t *testing.T) {
 }
 
 func TestStripSensitiveFields_Users(t *testing.T) {
-	item := json.RawMessage(`{"id":"u1","email":"a@b.com","password":"hash","token":"secret","last_access":"2024-01-01","last_page":"/admin","role":"admin-role"}`)
+	item := json.RawMessage(`{
+		"id":"u1","email":"a@b.com","role":"admin-role",
+		"password":"hash","token":"secret",
+		"tfa_secret":"JBSWY3DPEHPK3PXP","auth_data":{"refresh":"sso-refresh-tok"},
+		"last_access":"2024-01-01","last_page":"/admin",
+		"external_identifier":"sso-id-123","provider":"oauth"
+	}`)
 	result := stripSensitiveFields("users", item)
 
 	var obj map[string]json.RawMessage
@@ -163,15 +169,40 @@ func TestStripSensitiveFields_Users(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	for _, field := range []string{"password", "token", "last_access", "last_page"} {
+	// Every entry in sensitiveUserFields must be gone — drives off the
+	// canonical list so tests don't drift from the implementation.
+	for _, field := range sensitiveUserFields {
 		if _, ok := obj[field]; ok {
 			t.Errorf("field %q should be stripped from users", field)
 		}
 	}
-	for _, field := range []string{"id", "email", "role"} {
+	// Identity / metadata kept.
+	for _, field := range []string{"id", "email", "role", "external_identifier", "provider"} {
 		if _, ok := obj[field]; !ok {
 			t.Errorf("field %q should be preserved", field)
 		}
+	}
+}
+
+// TestStripSensitiveFields_TFASecret_Explicit — pin tfa_secret behavior on
+// its own so a future refactor that removes it from sensitiveUserFields
+// fails this test loudly. TOTP secrets are the strictest case in the
+// list; the test exists to prevent silent re-introduction.
+func TestStripSensitiveFields_TFASecret_Explicit(t *testing.T) {
+	item := json.RawMessage(`{"id":"u1","tfa_secret":"DO-NOT-LEAK","email":"x@y.z"}`)
+	result := stripSensitiveFields("users", item)
+	if strings.Contains(string(result), "DO-NOT-LEAK") {
+		t.Errorf("tfa_secret value leaked into export: %s", result)
+	}
+}
+
+// TestStripSensitiveFields_AuthData_Explicit — same pin for auth_data,
+// which holds SSO refresh material.
+func TestStripSensitiveFields_AuthData_Explicit(t *testing.T) {
+	item := json.RawMessage(`{"id":"u1","auth_data":{"refresh":"DO-NOT-LEAK"},"email":"x@y.z"}`)
+	result := stripSensitiveFields("users", item)
+	if strings.Contains(string(result), "DO-NOT-LEAK") {
+		t.Errorf("auth_data leaked into export: %s", result)
 	}
 }
 

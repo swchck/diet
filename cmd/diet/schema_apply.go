@@ -112,6 +112,17 @@ func fetchSnapshotMeta(client *apiClient) (snapshotMeta, error) {
 // directus_relations tables (the per-field path already does this — see
 // stripMetaID — and parity matters because /schema/diff and the per-field
 // POST path are supposed to converge on the same target state).
+//
+// On `meta.group` (forward-reference to a parent folder collection): the
+// per-field path strips it before POST then PATCHes it back, because
+// Directus rejects a group reference to a collection it hasn't seen yet.
+// We deliberately do NOT replicate that here — /schema/apply is atomic
+// (Directus sees the full topology in one shot) and empirically resolves
+// group references regardless of declaration order across real-world
+// archives. If a future Directus release tightens this, the symptom is a
+// 4xx from /schema/apply with a clear error message; we'd add the
+// strip+patch dance then. Defensive stripping today would force an extra
+// round-trip per import for no measurable correctness gain.
 func buildSnapshot(meta snapshotMeta, schema SchemaBundle) map[string]any {
 	collections := make([]map[string]any, 0, len(schema.Collections))
 	for _, c := range schema.Collections {
