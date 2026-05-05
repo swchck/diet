@@ -254,16 +254,16 @@ func TestInsertSystemItems_ParallelCounts(t *testing.T) {
 		items[i] = json.RawMessage(fmt.Sprintf(`{"id":%d}`, i))
 	}
 
-	inserted, failed := insertSystemItems(c, "/flows", items)
-	if inserted+failed != 20 {
-		t.Errorf("inserted+failed = %d, want 20", inserted+failed)
+	res := insertSystemItems(c, "/flows", items)
+	if res.Inserted+res.Skipped+res.Failed != 20 {
+		t.Errorf("total = %d, want 20", res.Inserted+res.Skipped+res.Failed)
 	}
 	// Server fails every 4th — exactly 5 of 20.
-	if failed != 5 {
-		t.Errorf("failed = %d, want 5", failed)
+	if res.Failed != 5 {
+		t.Errorf("failed = %d, want 5", res.Failed)
 	}
-	if inserted != 15 {
-		t.Errorf("inserted = %d, want 15", inserted)
+	if res.Inserted != 15 {
+		t.Errorf("inserted = %d, want 15", res.Inserted)
 	}
 	if peak.Load() < 2 {
 		t.Errorf("peak in-flight = %d, expected real parallelism", peak.Load())
@@ -280,9 +280,80 @@ func TestInsertSystemItems_EmptyInput(t *testing.T) {
 	defer srv.Close()
 
 	c := newClient(srv.URL, "tok")
-	inserted, failed := insertSystemItems(c, "/flows", nil)
-	if inserted != 0 || failed != 0 {
-		t.Errorf("inserted=%d failed=%d, want 0/0", inserted, failed)
+	res := insertSystemItems(c, "/flows", nil)
+	if res.Inserted != 0 || res.Failed != 0 || res.Skipped != 0 {
+		t.Errorf("got %+v, want zeroes", res)
+	}
+}
+
+// TestClassifySystemPostResult covers the trichotomy that decides whether a
+// failed POST counts as a real failure or a "row already there, leave it" skip.
+// The user's intent: don't overwrite existing values, just don't error either.
+func TestClassifySystemPostResult(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   systemPostResult
+	}{
+		{"2xx", 200, `{}`, sysResultInserted},
+		{"201 created", 201, `{"data":{"id":"x"}}`, sysResultInserted},
+		{"PK duplicate", 400,
+			`{"errors":[{"message":"...","extensions":{"code":"RECORD_NOT_UNIQUE","collection":"directus_users","field":"id"}}]}`,
+			sysResultDuplicate},
+		{"email duplicate", 400,
+			`{"errors":[{"message":"...","extensions":{"code":"RECORD_NOT_UNIQUE","collection":"directus_users","field":"email"}}]}`,
+			sysResultDuplicate},
+		{"validation error is not a skip", 400,
+			`{"errors":[{"message":"...","extensions":{"code":"FAILED_VALIDATION"}}]}`,
+			sysResultOther},
+		{"unauthenticated is not a skip", 401,
+			`{"errors":[{"message":"...","extensions":{"code":"INVALID_CREDENTIALS"}}]}`,
+			sysResultOther},
+		{"500 with no body", 500, ``, sysResultOther},
+		{"unparseable body", 400, `not json`, sysResultOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifySystemPostResult(tc.status, []byte(tc.body))
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInsertSystemItems_SkipsDuplicates wires a fake server that returns
+// RECORD_NOT_UNIQUE for half the items and 2xx for the rest. We expect the
+// duplicates to count as Skipped (not Failed) so partial-failure exit codes
+// don't fire on a re-run against a target that already has the bootstrap admin.
+func TestInsertSystemItems_SkipsDuplicates(t *testing.T) {
+	var seen atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := seen.Add(1)
+		if idx%2 == 0 {
+			w.WriteHeader(400)
+			w.Write([]byte(`{"errors":[{"message":"dup","extensions":{"code":"RECORD_NOT_UNIQUE"}}]}`))
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := newClient(srv.URL, "tok")
+	items := make([]json.RawMessage, 10)
+	for i := range items {
+		items[i] = json.RawMessage(fmt.Sprintf(`{"id":%d}`, i))
+	}
+	res := insertSystemItems(c, "/roles", items)
+	if res.Inserted != 5 {
+		t.Errorf("inserted=%d, want 5", res.Inserted)
+	}
+	if res.Skipped != 5 {
+		t.Errorf("skipped=%d, want 5", res.Skipped)
+	}
+	if res.Failed != 0 {
+		t.Errorf("failed=%d, want 0 (RECORD_NOT_UNIQUE must NOT count as failure)", res.Failed)
 	}
 }
 
