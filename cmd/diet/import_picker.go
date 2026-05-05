@@ -312,10 +312,19 @@ func (m *importPickerModel) rebuildTable() {
 		BorderForeground(borderColor).
 		BorderBottom(true).
 		Bold(true)
+	// Cursor highlight is a bright bold foreground rather than the
+	// table's default purple block. Reasoning: row content carries
+	// its own ANSI for the selection dot (green ● / dim ○). When the
+	// table wrapped a row in a heavy bg colour, our inline reset
+	// (\x1b[0m at the end of the dot's lipgloss Render) interrupted
+	// the bg paint mid-row — the user saw a tiny purple square with
+	// a green dot stuck to its edge instead of a uniform highlighted
+	// row. Using bold + bright fg avoids fighting with embedded ANSI
+	// while still making the cursor row obvious.
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(lipgloss.Color("57")).
-		Bold(false)
+		Foreground(lipgloss.Color("231")).
+		Background(lipgloss.NoColor{}).
+		Bold(true)
 
 	height := max(m.height-12, 5)
 	if !m.tblReady {
