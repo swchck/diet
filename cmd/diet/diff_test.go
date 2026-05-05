@@ -290,3 +290,153 @@ func TestDiffResult_EmptyCollections(t *testing.T) {
 	plain := renderDiffPlainText(result)
 	_ = json.RawMessage(plain) // just ensure it's a valid string
 }
+
+// TestAssembleDiffResult_DetectsCustomFieldDriftOnSystemCollection — diff
+// used to be blind to custom-field drift on directus_* collections (we
+// strip system collections at fetch time). After the export-side fix that
+// pulls custom system fields, diff has to surface the same drift or
+// `diet diff` silently lies about target schema parity.
+//
+// Test uses a non-alias custom field (`nickname` string on directus_users):
+// compareFields filters alias-type fields out of the field-level diff so
+// they wouldn't show up there, but adding any non-alias field is enough
+// to assert the system collection itself appears.
+func TestAssembleDiffResult_DetectsCustomFieldDriftOnSystemCollection(t *testing.T) {
+	src := &instanceData{
+		collections: []CollectionInfo{
+			{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)},
+		},
+		fields: map[string][]FieldInfo{
+			"posts": {{Field: "id", Type: "integer"}},
+			"directus_users": {
+				{Collection: "directus_users", Field: "nickname", Type: "string",
+					Schema: json.RawMessage(`{}`),
+					Meta:   json.RawMessage(`{}`)},
+			},
+		},
+		itemCounts:  map[string]int{"posts": 0},
+		systemCount: map[string]int{},
+	}
+	tgt := &instanceData{
+		collections: []CollectionInfo{
+			{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)},
+		},
+		fields: map[string][]FieldInfo{
+			"posts": {{Field: "id", Type: "integer"}},
+			// directus_users intentionally absent — that's the gap.
+		},
+		itemCounts:  map[string]int{"posts": 0},
+		systemCount: map[string]int{},
+	}
+
+	result := assembleDiffResult(src, tgt, "https://src", "https://tgt")
+
+	var sysEntry *collectionDiff
+	for i, c := range result.collections {
+		if c.name == "directus_users" {
+			sysEntry = &result.collections[i]
+		}
+	}
+	if sysEntry == nil {
+		t.Fatalf("expected directus_users in diff result, got %+v",
+			collectionNames(result.collections))
+	}
+	// Source-only directus_users in the merged collection set.
+	if sysEntry.status != diffAdded {
+		t.Errorf("directus_users: status = %d, want diffAdded (source-only)", sysEntry.status)
+	}
+}
+
+// TestAssembleDiffResult_NoCustomSystemFields_DoesNotEmitSystemRow —
+// symmetric case: when neither side has any custom system fields, the
+// diff result should not contain a directus_users entry at all (would be
+// noise).
+func TestAssembleDiffResult_NoCustomSystemFields_DoesNotEmitSystemRow(t *testing.T) {
+	src := &instanceData{
+		collections: []CollectionInfo{{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)}},
+		fields:      map[string][]FieldInfo{"posts": {{Field: "id", Type: "integer"}}},
+		itemCounts:  map[string]int{"posts": 0},
+		systemCount: map[string]int{},
+	}
+	tgt := &instanceData{
+		collections: []CollectionInfo{{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`)}},
+		fields:      map[string][]FieldInfo{"posts": {{Field: "id", Type: "integer"}}},
+		itemCounts:  map[string]int{"posts": 0},
+		systemCount: map[string]int{},
+	}
+
+	result := assembleDiffResult(src, tgt, "src", "tgt")
+	for _, c := range result.collections {
+		if c.name == "directus_users" {
+			t.Errorf("directus_users should not appear in diff when no custom fields exist on either side")
+		}
+	}
+}
+
+// TestAssembleDiffResult_BothSidesHaveDifferentCustomFields — both sides
+// have custom fields on directus_users, but different ones. Diff must
+// flag the directus_users row as changed and surface the per-field deltas.
+func TestAssembleDiffResult_BothSidesHaveDifferentCustomFields(t *testing.T) {
+	src := &instanceData{
+		collections: []CollectionInfo{},
+		fields: map[string][]FieldInfo{
+			"directus_users": {
+				{Collection: "directus_users", Field: "nickname", Type: "string",
+					Schema: json.RawMessage(`{}`), Meta: json.RawMessage(`{}`)},
+			},
+		},
+		itemCounts:  map[string]int{},
+		systemCount: map[string]int{},
+	}
+	tgt := &instanceData{
+		collections: []CollectionInfo{},
+		fields: map[string][]FieldInfo{
+			"directus_users": {
+				// Different field name on target — should show as removed.
+				{Collection: "directus_users", Field: "department", Type: "string",
+					Schema: json.RawMessage(`{}`), Meta: json.RawMessage(`{}`)},
+			},
+		},
+		itemCounts:  map[string]int{},
+		systemCount: map[string]int{},
+	}
+	result := assembleDiffResult(src, tgt, "src", "tgt")
+
+	var sysEntry *collectionDiff
+	for i, c := range result.collections {
+		if c.name == "directus_users" {
+			sysEntry = &result.collections[i]
+		}
+	}
+	if sysEntry == nil {
+		t.Fatal("expected directus_users in result")
+	}
+	if sysEntry.status != diffChanged {
+		t.Errorf("directus_users: status = %d, want diffChanged (different fields each side)", sysEntry.status)
+	}
+
+	// Field-level deltas.
+	var sawAdded, sawRemoved bool
+	for _, f := range sysEntry.fields {
+		if f.name == "nickname" && f.status == diffAdded {
+			sawAdded = true
+		}
+		if f.name == "department" && f.status == diffRemoved {
+			sawRemoved = true
+		}
+	}
+	if !sawAdded {
+		t.Errorf("expected nickname as diffAdded; got fields %+v", sysEntry.fields)
+	}
+	if !sawRemoved {
+		t.Errorf("expected department as diffRemoved; got fields %+v", sysEntry.fields)
+	}
+}
+
+func collectionNames(cs []collectionDiff) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.name)
+	}
+	return out
+}

@@ -180,10 +180,12 @@ func fetchInstanceData(client *apiClient, log func(string)) (*instanceData, erro
 
 	// Fetch fields and item counts in parallel.
 	var tableNames []string
+	tableSet := make(map[string]bool)
 	for _, c := range collections {
 		isFolder := string(c.Schema) == "null" || len(c.Schema) == 0
 		if !isFolder {
 			tableNames = append(tableNames, c.Collection)
+			tableSet[c.Collection] = true
 		}
 	}
 
@@ -208,6 +210,22 @@ func fetchInstanceData(client *apiClient, log func(string)) (*instanceData, erro
 		})
 	}
 	wg.Wait()
+
+	// Pull custom (non-system) fields on directus_* collections that the
+	// user-collection relations reference. Without this, diff falsely
+	// reports two instances as identical when one has a custom alias on
+	// directus_users (e.g. game_accounts) that the other lacks — exactly
+	// the gap the export path now closes via fetchSystemCustomFields, so
+	// diff coverage has to match.
+	if sysFields, err := fetchSystemCustomFields(client, relations, tableSet); err == nil {
+		// Append custom fields under their (system) collection name. The
+		// downstream comparator iterates data.fields by collection key —
+		// adding a directus_users entry here makes those fields show up in
+		// the diff just like any user collection's would.
+		for _, f := range sysFields {
+			data.fields[f.Collection] = append(data.fields[f.Collection], f)
+		}
+	}
 
 	log("Fetching system entities...")
 	for _, et := range systemEntityTypes {
@@ -240,24 +258,49 @@ func computeDiff(source, target *apiClient, sourceURL, targetURL string, log fun
 		return nil, fmt.Errorf("target: %w", tgtErr)
 	}
 
+	result := assembleDiffResult(srcData, tgtData, sourceURL, targetURL)
+	result.sourceClient = source
+	result.targetClient = target
+	return result, nil
+}
+
+// assembleDiffResult is the pure-logic half of computeDiff: it consumes
+// already-fetched per-side instanceData and produces the comparison
+// result. Pulled out so tests can exercise the per-collection /
+// per-field logic without standing up two fake servers.
+func assembleDiffResult(srcData, tgtData *instanceData, sourceURL, targetURL string) *diffResult {
 	result := &diffResult{
-		sourceURL:    sourceURL,
-		targetURL:    targetURL,
-		sourceClient: source,
-		targetClient: target,
+		sourceURL: sourceURL,
+		targetURL: targetURL,
 	}
 
-	// Build collection sets (tables only, not folders).
+	// Build collection sets (tables only, not folders). System
+	// collections (directus_*) are not in `data.collections` — we filter
+	// them at fetch time — but if either side has custom fields on a
+	// system collection (e.g. directus_users.game_accounts) those will
+	// have been deposited under their system-collection key in
+	// data.fields. Include those keys so the per-collection diff covers
+	// custom-field drift on directus_users / directus_files / etc.
 	srcCols := make(map[string]bool)
 	for _, c := range srcData.collections {
 		if string(c.Schema) != "null" && len(c.Schema) > 0 {
 			srcCols[c.Collection] = true
 		}
 	}
+	for col := range srcData.fields {
+		if strings.HasPrefix(col, "directus_") && len(srcData.fields[col]) > 0 {
+			srcCols[col] = true
+		}
+	}
 	tgtCols := make(map[string]bool)
 	for _, c := range tgtData.collections {
 		if string(c.Schema) != "null" && len(c.Schema) > 0 {
 			tgtCols[c.Collection] = true
+		}
+	}
+	for col := range tgtData.fields {
+		if strings.HasPrefix(col, "directus_") && len(tgtData.fields[col]) > 0 {
+			tgtCols[col] = true
 		}
 	}
 
@@ -342,7 +385,7 @@ func computeDiff(source, target *apiClient, sourceURL, targetURL string, log fun
 		})
 	}
 
-	return result, nil
+	return result
 }
 
 func compareFields(srcFields, tgtFields []FieldInfo) []fieldDiff {
