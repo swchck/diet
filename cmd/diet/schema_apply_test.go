@@ -40,6 +40,37 @@ func TestBuildSnapshot_OmitsSchemaForFolders(t *testing.T) {
 	}
 }
 
+// TestSanitizeFieldForSnapshot_StripsMetaID — the source instance's
+// directus_fields surrogate id is instance-scoped; sending it into the
+// target's snapshot risks colliding with the target's own auto-increment.
+// The per-field path strips it via stripMetaID; parity required here.
+func TestSanitizeFieldForSnapshot_StripsMetaID(t *testing.T) {
+	f := FieldInfo{
+		Collection: "posts",
+		Field:      "title",
+		Type:       "string",
+		Schema:     json.RawMessage(`{"default_value":"hi"}`),
+		Meta:       json.RawMessage(`{"id":12345,"sort":3,"interface":"input"}`),
+	}
+	raw := sanitizeFieldForSnapshot(f)
+	var out FieldInfo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var meta map[string]json.RawMessage
+	json.Unmarshal(out.Meta, &meta)
+	if _, has := meta["id"]; has {
+		t.Errorf("meta.id should be stripped, got %s", out.Meta)
+	}
+	// Other meta keys preserved.
+	if _, has := meta["sort"]; !has {
+		t.Errorf("sort should be preserved, got %s", out.Meta)
+	}
+	if _, has := meta["interface"]; !has {
+		t.Errorf("interface should be preserved")
+	}
+}
+
 func TestSanitizeFieldForSnapshot_StripsNextvalDefault(t *testing.T) {
 	schema, _ := json.Marshal(map[string]any{
 		"default_value":      `nextval('x_id_seq'::regclass)`,
@@ -292,6 +323,69 @@ func TestStripAccountability_HandlesGarbageMeta(t *testing.T) {
 		if string(m["accountability"]) != "null" {
 			t.Errorf("%s: accountability = %s, want null", c.Collection, m["accountability"])
 		}
+	}
+}
+
+// TestBuildSnapshot_StripsMetaIDFromCollectionsAndRelations — same logic as
+// the per-field stripMetaID path, but applied to the bulk-snapshot collections
+// and relations slices. Without this, the target's directus_collections /
+// directus_relations rows can land with foreign surrogate IDs.
+func TestBuildSnapshot_StripsMetaIDFromCollectionsAndRelations(t *testing.T) {
+	bundle := SchemaBundle{
+		Collections: []CollectionInfo{
+			{Collection: "posts", Schema: json.RawMessage(`{"name":"posts"}`),
+				Meta: json.RawMessage(`{"id":7,"icon":"article","note":"hi"}`)},
+		},
+		Fields: []FieldInfo{
+			{Collection: "posts", Field: "id", Type: "integer",
+				Schema: json.RawMessage(`{"is_primary_key":true}`),
+				Meta:   json.RawMessage(`{"id":99,"sort":1}`)},
+		},
+		Relations: []RelationInfo{
+			{Collection: "posts", Field: "author", RelatedCollection: "users",
+				Schema: json.RawMessage(`{}`),
+				Meta:   json.RawMessage(`{"id":42,"one_field":"author_posts"}`)},
+		},
+	}
+	snap := buildSnapshot(snapshotMeta{Version: 1, Directus: "11.17.0", Vendor: "postgres"}, bundle)
+
+	// Collections meta.id stripped, other keys preserved.
+	c := snap["collections"].([]map[string]any)[0]
+	cMeta := c["meta"].(json.RawMessage)
+	var cm map[string]json.RawMessage
+	json.Unmarshal(cMeta, &cm)
+	if _, has := cm["id"]; has {
+		t.Errorf("collection meta.id leaked: %s", cMeta)
+	}
+	if _, has := cm["icon"]; !has {
+		t.Errorf("collection meta.icon dropped: %s", cMeta)
+	}
+
+	// Fields meta.id stripped, sort preserved.
+	var f FieldInfo
+	json.Unmarshal(snap["fields"].([]json.RawMessage)[0], &f)
+	var fm map[string]json.RawMessage
+	json.Unmarshal(f.Meta, &fm)
+	if _, has := fm["id"]; has {
+		t.Errorf("field meta.id leaked: %s", f.Meta)
+	}
+	if _, has := fm["sort"]; !has {
+		t.Errorf("field meta.sort dropped")
+	}
+
+	// Relations meta.id stripped.
+	var r RelationInfo
+	json.Unmarshal(snap["relations"].([]json.RawMessage)[0], &r)
+	var rm map[string]json.RawMessage
+	json.Unmarshal(r.Meta, &rm)
+	if _, has := rm["id"]; has {
+		t.Errorf("relation meta.id leaked: %s", r.Meta)
+	}
+	if _, has := rm["one_field"]; !has {
+		t.Errorf("relation meta.one_field dropped")
+	}
+	if r.Collection != "posts" || r.Field != "author" || r.RelatedCollection != "users" {
+		t.Errorf("relation core fields lost: %+v", r)
 	}
 }
 

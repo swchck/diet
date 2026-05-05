@@ -106,13 +106,18 @@ func fetchSnapshotMeta(client *apiClient) (snapshotMeta, error) {
 
 // buildSnapshot reshapes archive structures into the on-the-wire snapshot
 // shape Directus expects. Collections lose their schema key for folders;
-// fields with sequence-managed defaults have the default stripped.
+// fields with sequence-managed defaults have the default stripped; every
+// `meta.id` is dropped so we don't ship the source instance's surrogate
+// keys into the target's directus_collections / directus_fields /
+// directus_relations tables (the per-field path already does this — see
+// stripMetaID — and parity matters because /schema/diff and the per-field
+// POST path are supposed to converge on the same target state).
 func buildSnapshot(meta snapshotMeta, schema SchemaBundle) map[string]any {
 	collections := make([]map[string]any, 0, len(schema.Collections))
 	for _, c := range schema.Collections {
 		entry := map[string]any{
 			"collection": c.Collection,
-			"meta":       json.RawMessage(c.Meta),
+			"meta":       stripMetaID(c.Meta),
 		}
 		// Folders ship with schema=null in the archive. The snapshot format
 		// represents folders by simply omitting the schema key.
@@ -129,7 +134,12 @@ func buildSnapshot(meta snapshotMeta, schema SchemaBundle) map[string]any {
 
 	relations := make([]json.RawMessage, 0, len(schema.Relations))
 	for _, r := range schema.Relations {
-		raw, _ := json.Marshal(r)
+		// Stripping meta.id from RelationInfo: marshal a copy with cleaned
+		// meta. We can't mutate the original because schema is shared and
+		// the per-field path may still want to read it.
+		clean := r
+		clean.Meta = stripMetaID(r.Meta)
+		raw, _ := json.Marshal(clean)
 		relations = append(relations, raw)
 	}
 
@@ -144,27 +154,31 @@ func buildSnapshot(meta snapshotMeta, schema SchemaBundle) map[string]any {
 }
 
 // sanitizeFieldForSnapshot strips DB-specific defaults that /schema/apply
-// can't round-trip. Right now: nextval(...) / ::regclass expressions on
-// auto-increment columns. Directus regenerates the sequence at apply time.
+// can't round-trip and the source instance's surrogate meta.id (which would
+// otherwise ride along into the target's directus_fields auto-increment
+// space). Right now schema-side: nextval(...) / ::regclass expressions on
+// auto-increment columns — Directus regenerates the sequence at apply time.
 func sanitizeFieldForSnapshot(f FieldInfo) json.RawMessage {
-	raw, _ := json.Marshal(f)
+	clean := f
+	clean.Meta = stripMetaID(f.Meta)
+
 	if isNullOrEmpty(f.Schema) {
+		raw, _ := json.Marshal(clean)
 		return raw
 	}
 	var schemaMap map[string]any
 	if err := json.Unmarshal(f.Schema, &schemaMap); err != nil {
+		raw, _ := json.Marshal(clean)
 		return raw
 	}
 	if defv, ok := schemaMap["default_value"].(string); ok {
 		if strings.HasPrefix(defv, "nextval(") || strings.Contains(defv, "::regclass") {
 			schemaMap["default_value"] = nil
-			fixed := f
-			fixed.Schema, _ = json.Marshal(schemaMap)
-			out, _ := json.Marshal(fixed)
-			return out
+			clean.Schema, _ = json.Marshal(schemaMap)
 		}
 	}
-	return raw
+	out, _ := json.Marshal(clean)
+	return out
 }
 
 func isNullOrEmpty(raw json.RawMessage) bool {
