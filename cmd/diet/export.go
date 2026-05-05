@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -107,6 +108,19 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 		}
 	}
 
+	// Pull custom fields on system collections (directus_users, etc.) that
+	// our relations reference — otherwise the relation would land in the
+	// archive but the field it points at would not.
+	systemFields, err := fetchSystemCustomFields(client, exportRelations, selectedSet)
+	if err != nil {
+		return fmt.Errorf("fetch system custom fields: %w", err)
+	}
+	if len(systemFields) > 0 {
+		fmt.Printf("  System custom fields: %d (on %s)\n",
+			len(systemFields), summarizeSystemFieldCollections(systemFields))
+		allFields = append(allFields, systemFields...)
+	}
+
 	fmt.Printf("  %d collections, %d fields, %d relations\n",
 		len(exportCollections), len(allFields), len(exportRelations))
 
@@ -166,4 +180,20 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 		len(selected), len(allFields), len(exportRelations), totalItems)
 
 	return nil
+}
+
+// summarizeSystemFieldCollections renders a comma-joined list of distinct
+// system collections that ended up contributing custom fields. Callers use
+// it for a one-line export-progress hint.
+func summarizeSystemFieldCollections(fields []FieldInfo) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, f := range fields {
+		if seen[f.Collection] {
+			continue
+		}
+		seen[f.Collection] = true
+		names = append(names, f.Collection)
+	}
+	return strings.Join(names, ", ")
 }

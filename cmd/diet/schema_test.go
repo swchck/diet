@@ -343,6 +343,137 @@ func TestCreateRelations_Parallel(t *testing.T) {
 	}
 }
 
+// TestIsSystemField — meta.system == true marks built-in Directus fields.
+// Custom user-added fields have it absent or false; both must be reported
+// as non-system so we round-trip them.
+func TestIsSystemField(t *testing.T) {
+	cases := []struct {
+		name string
+		meta string
+		want bool
+	}{
+		{"true", `{"system":true}`, true},
+		{"false", `{"system":false}`, false},
+		{"absent", `{"sort":1}`, false},
+		{"null meta", `null`, false},
+		{"empty meta", `{}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := FieldInfo{Meta: json.RawMessage(tc.meta)}
+			if got := isSystemField(f); got != tc.want {
+				t.Errorf("isSystemField(%s) = %v, want %v", tc.meta, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFetchSystemCustomFields — when a relation pulls in a directus_*
+// collection on either side, we fetch its fields and keep only the
+// non-system ones.
+func TestFetchSystemCustomFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fields/directus_users":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[
+				{"collection":"directus_users","field":"id","type":"uuid","meta":{"system":true},"schema":{"is_primary_key":true}},
+				{"collection":"directus_users","field":"first_name","type":"string","meta":{"system":true},"schema":{}},
+				{"collection":"directus_users","field":"game_accounts","type":"alias","meta":{"system":false,"interface":"list-m2m","special":["m2m"]}}
+			]}`))
+		case "/fields/directus_files":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[
+				{"collection":"directus_files","field":"id","type":"uuid","meta":{"system":true},"schema":{"is_primary_key":true}},
+				{"collection":"directus_files","field":"watermark","type":"boolean","meta":{},"schema":{}}
+			]}`))
+		case "/fields/directus_dashboards":
+			t.Errorf("unexpected fetch for unreferenced system collection")
+			w.WriteHeader(404)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	c.Concurrency = 4
+
+	relations := []RelationInfo{
+		// User collection → directus_users (FK), system on related side.
+		{Collection: "features_whitelist", RelatedCollection: "directus_users"},
+		// directus_users → user collection (alias on system side).
+		{Collection: "directus_users", Field: "game_accounts", RelatedCollection: "features_whitelist"},
+		// User collection → directus_files (FK).
+		{Collection: "posts", RelatedCollection: "directus_files"},
+		// User → user (no system involvement).
+		{Collection: "posts", RelatedCollection: "users"},
+		// directus_dashboards is not on either side of a user-collection
+		// relation — must NOT be fetched.
+	}
+
+	userColSet := map[string]bool{
+		"features_whitelist": true,
+		"posts":              true,
+		"users":              true,
+	}
+
+	got, err := fetchSystemCustomFields(c, relations, userColSet)
+	if err != nil {
+		t.Fatalf("fetchSystemCustomFields: %v", err)
+	}
+
+	want := map[string]bool{
+		"directus_files.watermark":     true,
+		"directus_users.game_accounts": true,
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d fields, want %d: %+v", len(got), len(want), got)
+	}
+	for _, f := range got {
+		key := f.Collection + "." + f.Field
+		if !want[key] {
+			t.Errorf("unexpected field returned: %s", key)
+		}
+	}
+	// System fields must be filtered out.
+	for _, f := range got {
+		if isSystemField(f) {
+			t.Errorf("system field leaked through: %s.%s", f.Collection, f.Field)
+		}
+	}
+}
+
+func TestFetchSystemCustomFields_NoSystemReferences(t *testing.T) {
+	// No system collection appears on either side of any user-relation.
+	// Helper must early-return without any HTTP calls.
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, "tok")
+	relations := []RelationInfo{
+		{Collection: "posts", RelatedCollection: "users"},
+		{Collection: "tags", RelatedCollection: "posts"},
+	}
+	got, err := fetchSystemCustomFields(c, relations, map[string]bool{
+		"posts": true, "users": true, "tags": true,
+	})
+	if err != nil {
+		t.Fatalf("fetchSystemCustomFields: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected no fields, got %d", len(got))
+	}
+	if called {
+		t.Errorf("expected no HTTP calls, but server was hit")
+	}
+}
+
 func TestStripMetaID(t *testing.T) {
 	meta := json.RawMessage(`{"id":123,"sort":5,"note":"hello"}`)
 	result := stripMetaID(meta)

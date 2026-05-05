@@ -295,6 +295,63 @@ func TestStripAccountability_HandlesGarbageMeta(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshot_EmitsCustomFieldsOnSystemCollections — when the bundle
+// carries a custom field on directus_users (e.g. an M2M alias), the snapshot
+// must include the field WITHOUT inventing a directus_users collection
+// entry. Directus already owns the system collection and will reject any
+// attempt to recreate it.
+func TestBuildSnapshot_EmitsCustomFieldsOnSystemCollections(t *testing.T) {
+	bundle := SchemaBundle{
+		Collections: []CollectionInfo{
+			// Only user collections — fetchCollections strips directus_*.
+			{Collection: "features_whitelist", Schema: json.RawMessage(`{"name":"features_whitelist"}`), Meta: json.RawMessage(`{}`)},
+		},
+		Fields: []FieldInfo{
+			{Collection: "features_whitelist", Field: "id", Type: "integer",
+				Schema: json.RawMessage(`{"is_primary_key":true}`), Meta: json.RawMessage(`{}`)},
+			{Collection: "directus_users", Field: "game_accounts", Type: "alias",
+				Schema: json.RawMessage(`null`),
+				Meta:   json.RawMessage(`{"interface":"list-m2m","special":["m2m"]}`)},
+		},
+		Relations: []RelationInfo{
+			{Collection: "directus_users", Field: "game_accounts", RelatedCollection: "features_whitelist",
+				Schema: json.RawMessage(`null`), Meta: json.RawMessage(`{}`)},
+		},
+	}
+	snap := buildSnapshot(snapshotMeta{Version: 1, Directus: "11.17.0", Vendor: "postgres"}, bundle)
+
+	// Snapshot must NOT contain a directus_users collection entry — Directus
+	// owns that table and the diff endpoint would reject creation.
+	for _, c := range snap["collections"].([]map[string]any) {
+		if c["collection"] == "directus_users" {
+			t.Errorf("snapshot must not include system collection directus_users")
+		}
+	}
+
+	// But the custom field on directus_users must be present.
+	var seen bool
+	for _, raw := range snap["fields"].([]json.RawMessage) {
+		var f FieldInfo
+		if err := json.Unmarshal(raw, &f); err != nil {
+			t.Fatalf("field unmarshal: %v", err)
+		}
+		if f.Collection == "directus_users" && f.Field == "game_accounts" {
+			seen = true
+			if f.Type != "alias" {
+				t.Errorf("type = %s, want alias", f.Type)
+			}
+		}
+	}
+	if !seen {
+		t.Errorf("custom field directus_users.game_accounts missing from snapshot")
+	}
+
+	// Relation must be preserved as-is.
+	if len(snap["relations"].([]json.RawMessage)) != 1 {
+		t.Errorf("expected 1 relation, got %d", len(snap["relations"].([]json.RawMessage)))
+	}
+}
+
 func TestBuildSnapshot_RoundTripSize(t *testing.T) {
 	colls := make([]CollectionInfo, 100)
 	for i := range colls {

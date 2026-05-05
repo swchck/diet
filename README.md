@@ -8,6 +8,7 @@ Full-fidelity export and import of Directus collections with all metadata, valid
 
 - **Full metadata preservation** — field notes, validation rules, interface options, O2M table layout, display settings, sort order
 - **System entities** — export/import flows, operations, dashboards, panels, roles, presets, translations, webhooks
+- **Custom fields on system collections** — fields you've added to `directus_users` / `directus_files` / etc. (e.g. an M2M alias on `directus_users` pointing at one of your collections) are detected via relations and round-tripped automatically; built-in fields are skipped
 - **Bulk schema apply** — uses Directus `/schema/diff` + `/schema/apply` for ~30× faster schema phase, with automatic fallback to per-field POSTs
 - **Parallel data import** — concurrent chunk POSTs inside each collection while preserving FK-safe topological order
 - **Optional audit-log skip** — `--strip-accountability` cuts data import time roughly in half by setting `meta.accountability=null` on collections
@@ -226,3 +227,4 @@ go test -race -count=1 ./...
 
 - **Sort field** — The `meta.sort_field` property on collections (used for drag-and-drop sorting in Directus UI) is not recreated on import. This field is managed by Directus internally and requires manual setup after import.
 - **Users/permissions** — Not included in system entity export to avoid sensitive data and cross-instance reference issues.
+- **System collections without inbound relations** — custom fields on `directus_*` collections are picked up only when at least one of your user-collection relations references them. Standalone fields (e.g. a custom `nickname` column on `directus_users` with no FK pointing at it) are not exported. If you need those, export them manually or open an issue.
