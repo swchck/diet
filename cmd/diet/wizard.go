@@ -24,11 +24,19 @@ import (
 type profile struct {
 	URL         string `yaml:"url"`
 	Token       string `yaml:"token"`
-	Concurrency int    `yaml:"concurrency,omitempty"` // parallel workers (default 6)
-	Timeout     int    `yaml:"timeout,omitempty"`     // HTTP timeout in seconds (default 60)
-	BatchSize   int    `yaml:"batch_size,omitempty"`  // items per batch POST (default 100)
+	Concurrency int    `yaml:"concurrency,omitempty"`  // parallel workers (default 6)
+	Timeout     int    `yaml:"timeout,omitempty"`      // HTTP timeout in seconds (default 60)
+	BatchSize   int    `yaml:"batch_size,omitempty"`   // items per batch POST (default 100)
 	RetryPasses int    `yaml:"retry_passes,omitempty"` // max retry passes (default 5)
-	Format      string `yaml:"format,omitempty"`      // archive format: zstd or zip (default zstd)
+	Format      string `yaml:"format,omitempty"`       // archive format: zstd or zip (default zstd)
+	// Unsafe marks a profile as production / shared / "you really do
+	// not want to nuke this by accident". When true, every wizard-
+	// driven import (against this profile as target) and every clean
+	// (against this profile as source) shows a typed-host confirmation
+	// prompt — y/N isn't enough, the user has to retype the URL host.
+	// CLI direct invocations (diet import --target-url=...) do NOT
+	// consult this field, so automation pipelines aren't blocked.
+	Unsafe bool `yaml:"unsafe,omitempty"`
 }
 
 func (p profile) clientOptions() clientOptions {
@@ -120,21 +128,17 @@ type wizardResult struct {
 	inputFile   string  // for import: archive path
 	profileName string
 	cancelled   bool
-
-	// Per-import toggles surfaced in stepImportOptions.
-	stripAccountability bool
 }
 
 // Wizard steps
 
 const (
-	stepOperation     = iota
-	stepProfile       // select server profile
-	stepNewProfile    // create new profile (name + url + token + settings)
-	stepImportFile    // import: enter archive path
-	stepImportTarget  // import: select target profile
-	stepNewTarget     // import: create new target profile
-	stepImportOptions // import: per-run toggles (strip accountability, ...)
+	stepOperation    = iota
+	stepProfile      // select server profile
+	stepNewProfile   // create new profile (name + url + token + settings)
+	stepImportFile   // import: enter archive path
+	stepImportTarget // import: select target profile
+	stepNewTarget    // import: create new target profile
 )
 
 // Wizard model
@@ -161,9 +165,14 @@ type wizardModel struct {
 	selectedTarget  string
 	inputFile       string
 
-	// Step: import options (stepImportOptions)
-	importOptionIdx     int  // currently focused option row
-	stripAccountability bool // toggle 1
+	// Step: import file — list of archives discovered in the current
+	// working directory, populated by buildFileInput. Sorted with most
+	// recently modified first since the typical flow is "exported a
+	// minute ago, want to import now". The textinput stays the
+	// authoritative source of truth; this list is just suggestions
+	// the user can tab/up-down through.
+	fileSuggestions   []string
+	fileSuggestionIdx int // -1 = textinput focused; >=0 = list cursor
 
 	done      bool
 	cancelled bool
@@ -209,6 +218,46 @@ func (m *wizardModel) buildFileInput() {
 	m.inputs[0] = newInput("diet-export-20240115-100000.tar.zst", "")
 	m.focusIdx = 0
 	m.inputs[0].Focus()
+	m.fileSuggestions = scanLocalArchives(".")
+	m.fileSuggestionIdx = -1
+}
+
+// scanLocalArchives returns a list of `*.tar.zst` and `*.zip` files in
+// the given directory, most-recently-modified first. Anything else is
+// ignored — the wizard cares about diet archives, not arbitrary files.
+// On error (unreadable dir) returns nil silently; the textinput still
+// works as a fallback for users with archives elsewhere.
+func scanLocalArchives(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	type sortable struct {
+		name  string
+		mtime int64
+	}
+	var found []sortable
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".tar.zst") && !strings.HasSuffix(name, ".zip") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		found = append(found, sortable{name: name, mtime: info.ModTime().Unix()})
+	}
+	// Newest first.
+	sort.Slice(found, func(i, j int) bool { return found[i].mtime > found[j].mtime })
+	out := make([]string, len(found))
+	for i, s := range found {
+		out[i] = s.name
+	}
+	return out
 }
 
 func newInput(placeholder, value string) textinput.Model {
@@ -270,52 +319,6 @@ func (m wizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleNewProfileKey(msg)
 	case stepImportFile:
 		return m.handleFileKey(msg)
-	case stepImportOptions:
-		return m.handleImportOptionsKey(msg)
-	}
-	return m, nil
-}
-
-// importOptions is the canonical list of toggles the user can flip on the
-// stepImportOptions screen. Adding a new option here automatically renders
-// it in viewImportOptionsStep and tracks toggle state via getter/setter.
-var importOptions = []struct {
-	label string
-	desc  string
-	get   func(*wizardModel) bool
-	set   func(*wizardModel, bool)
-}{
-	{
-		label: "Strip accountability",
-		desc:  "skip activity + revisions logging — much faster, audit log empty",
-		get:   func(m *wizardModel) bool { return m.stripAccountability },
-		set:   func(m *wizardModel, v bool) { m.stripAccountability = v },
-	},
-}
-
-func (m wizardModel) handleImportOptionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "up", "k":
-		if m.importOptionIdx > 0 {
-			m.importOptionIdx--
-		}
-	case "down", "j":
-		if m.importOptionIdx < len(importOptions)-1 {
-			m.importOptionIdx++
-		}
-	case " ", "x":
-		opt := importOptions[m.importOptionIdx]
-		opt.set(&m, !opt.get(&m))
-	case "enter":
-		m.done = true
-		return m, tea.Quit
-	case "esc":
-		// Step back to target selection.
-		m.goToProfileSelect(stepImportTarget)
-		return m, nil
-	case "q":
-		m.cancelled = true
-		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -387,9 +390,11 @@ func (m wizardModel) handleProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			name := m.profileNames[m.profileIdx]
 			if m.step == stepImportTarget {
 				m.selectedTarget = name
-				m.step = stepImportOptions
-				m.importOptionIdx = 0
-				return m, nil
+				// Target picked — wizard is done; the dispatch
+				// then runs runImportPicker for items + safety
+				// params before kicking off the import.
+				m.done = true
+				return m, tea.Quit
 			}
 			m.selectedProfile = name
 			m.done = true
@@ -419,12 +424,8 @@ func (m wizardModel) handleNewProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.validateRequired() {
 			m.saveNewProfile()
-			// New target for import → go to options screen instead of quitting.
-			if m.step == stepNewTarget {
-				m.step = stepImportOptions
-				m.importOptionIdx = 0
-				return m, nil
-			}
+			// New target for import → wizard done; dispatch runs
+			// runImportPicker next for items + safety params.
 			m.done = true
 			return m, tea.Quit
 		}
@@ -467,6 +468,13 @@ func (m wizardModel) handleNewProfileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m wizardModel) handleFileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		// If the suggestion list is focused, accept the highlighted
+		// suggestion as the path. Otherwise read the textinput.
+		if m.fileSuggestionIdx >= 0 && m.fileSuggestionIdx < len(m.fileSuggestions) {
+			m.inputFile = m.fileSuggestions[m.fileSuggestionIdx]
+			m.goToProfileSelect(stepImportTarget)
+			return m, nil
+		}
 		if strings.TrimSpace(m.inputs[0].Value()) != "" {
 			m.inputFile = strings.TrimSpace(m.inputs[0].Value())
 			m.goToProfileSelect(stepImportTarget)
@@ -474,7 +482,67 @@ func (m wizardModel) handleFileKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.step = stepOperation
 		return m, nil
+	case "down":
+		// Move from the textinput into the suggestion list, or down
+		// within it. Wraps at the bottom back into the textinput.
+		if len(m.fileSuggestions) == 0 {
+			return m, nil
+		}
+		switch {
+		case m.fileSuggestionIdx < 0:
+			m.fileSuggestionIdx = 0
+			m.inputs[0].Blur()
+		case m.fileSuggestionIdx < len(m.fileSuggestions)-1:
+			m.fileSuggestionIdx++
+		default:
+			m.fileSuggestionIdx = -1
+			m.inputs[0].Focus()
+		}
+		return m, nil
+	case "up":
+		if len(m.fileSuggestions) == 0 {
+			return m, nil
+		}
+		switch {
+		case m.fileSuggestionIdx < 0:
+			m.fileSuggestionIdx = len(m.fileSuggestions) - 1
+			m.inputs[0].Blur()
+		case m.fileSuggestionIdx > 0:
+			m.fileSuggestionIdx--
+		default:
+			m.fileSuggestionIdx = -1
+			m.inputs[0].Focus()
+		}
+		return m, nil
+	case "tab":
+		// Tab autocompletes the textinput from the first matching
+		// suggestion. If nothing matches the current prefix, fall
+		// through to the textinput's default tab handling so the
+		// caret moves predictably.
+		typed := strings.TrimSpace(m.inputs[0].Value())
+		if typed != "" {
+			for _, s := range m.fileSuggestions {
+				if strings.HasPrefix(s, typed) {
+					m.inputs[0].SetValue(s)
+					m.inputs[0].CursorEnd()
+					return m, nil
+				}
+			}
+		}
+		// Empty input + tab: jump into the suggestion list at top.
+		if len(m.fileSuggestions) > 0 {
+			m.fileSuggestionIdx = 0
+			m.inputs[0].Blur()
+		}
+		return m, nil
 	default:
+		// Any other key: if list is focused, ignore (keeps the user
+		// from accidentally typing into a hidden textinput). When
+		// textinput is focused, forward the keypress so typing,
+		// backspace, etc. work as usual.
+		if m.fileSuggestionIdx >= 0 {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.inputs[m.focusIdx], cmd = m.inputs[m.focusIdx].Update(msg)
 		return m, cmd
@@ -525,11 +593,10 @@ func (m *wizardModel) saveNewProfile() {
 
 func (m wizardModel) result() wizardResult {
 	res := wizardResult{
-		operation:           strings.ToLower(m.operations[m.operation]),
-		profileName:         m.selectedProfile,
-		inputFile:           m.inputFile,
-		cancelled:           m.cancelled,
-		stripAccountability: m.stripAccountability,
+		operation:   strings.ToLower(m.operations[m.operation]),
+		profileName: m.selectedProfile,
+		inputFile:   m.inputFile,
+		cancelled:   m.cancelled,
 	}
 	if m.selectedProfile != "" {
 		res.prof = m.cfg.Profiles[m.selectedProfile]
@@ -541,33 +608,19 @@ func (m wizardModel) result() wizardResult {
 }
 
 // View
-
-// wizardBanner is the centered title block shown at the top of every step.
-func (m wizardModel) wizardBanner() string {
-	logo := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(borderColor).
-		Render("◆  D I E T")
-	tag := lipgloss.NewStyle().
-		Foreground(dimColor).
-		Render("Directus Import Export Tool")
-	ver := lipgloss.NewStyle().
-		Foreground(dimColor).
-		Render("v" + version)
-	return lipgloss.JoinVertical(lipgloss.Center, logo, tag, ver)
-}
+// (banner moved to ui.go as uiBanner — shared with import picker.)
 
 // wizardHints renders a row of colored key chips for the current step.
 func (m wizardModel) wizardHints() string {
 	switch m.step {
-	case stepNewProfile, stepNewTarget, stepImportFile:
-		return renderKeyHint("tab", "next field") + "   " +
+	case stepImportFile:
+		return renderKeyHint("↑↓", "browse") + "   " +
+			renderKeyHint("tab", "complete") + "   " +
 			renderKeyHint("enter", "confirm") + "   " +
 			renderKeyHint("esc", "back")
-	case stepImportOptions:
-		return renderKeyHint("↑↓", "select") + "   " +
-			renderKeyHint("space", "toggle") + "   " +
-			renderKeyHint("enter", "start import") + "   " +
+	case stepNewProfile, stepNewTarget:
+		return renderKeyHint("tab", "next field") + "   " +
+			renderKeyHint("enter", "confirm") + "   " +
 			renderKeyHint("esc", "back")
 	default:
 		return renderKeyHint("↑↓", "select") + "   " +
@@ -581,30 +634,19 @@ func (m wizardModel) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
-
-	var body string
 	switch m.step {
 	case stepOperation:
-		body = m.viewOperationStep()
+		return m.viewOperationStep()
 	case stepProfile:
-		body = m.viewProfileStep("Select source server", m.cfg.Profiles)
+		return m.viewProfileStep("Select source server", m.cfg.Profiles)
 	case stepImportTarget:
-		body = m.viewProfileStep("Select target server", m.cfg.Profiles)
+		return m.viewProfileStep("Select target server", m.cfg.Profiles)
 	case stepNewProfile, stepNewTarget:
-		body = m.viewInputStep()
+		return m.viewInputStep()
 	case stepImportFile:
-		body = m.viewInputStep()
-	case stepImportOptions:
-		body = m.viewImportOptionsStep()
+		return m.viewFileStep()
 	}
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(1, 4).
-		Render(body)
-
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return ""
 }
 
 // stepLabel describes the current step in the breadcrumb-style sub-heading.
@@ -622,8 +664,6 @@ func (m wizardModel) stepLabel() string {
 		return "Import · new target profile"
 	case stepImportFile:
 		return "Import · archive path"
-	case stepImportOptions:
-		return "Import · options"
 	}
 	return ""
 }
@@ -697,16 +737,7 @@ func (m wizardModel) viewOperationStep() string {
 
 	body := lipgloss.NewStyle().Width(tableW).Render(
 		lipgloss.JoinVertical(lipgloss.Left, rows...))
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		body,
-		"",
-		m.wizardHints(),
-	)
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) string {
@@ -722,63 +753,58 @@ func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) stri
 		rows[i] = renderListRow(name, desc, i == m.profileIdx, isNew)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(56).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(56).Render(
+		lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
-// viewImportOptionsStep renders the per-import toggle list. Currently one
-// row (strip-accountability); the importOptions slice is the extension
-// point — adding an entry there auto-renders here.
-func (m wizardModel) viewImportOptionsStep() string {
+// viewFileStep is a specialised input step that combines the textinput
+// (canonical source for the path) with a list of archives discovered in
+// the current working directory. The user can type a path, press tab to
+// autocomplete from the first matching suggestion, or arrow down into
+// the list and pick a file directly. This solves the original UX gripe
+// that "there's no hint what archives I have here".
+func (m wizardModel) viewFileStep() string {
 	heading := lipgloss.NewStyle().Foreground(dimColor).Render(m.stepLabel())
 
-	rows := make([]string, 0, len(importOptions))
-	for i, opt := range importOptions {
-		isCursor := i == m.importOptionIdx
-		on := opt.get(&m)
+	labelStyle := lipgloss.NewStyle().
+		Foreground(labelCol).
+		Width(14).
+		Align(lipgloss.Right)
+	if m.fileSuggestionIdx < 0 {
+		labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+	}
+	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		labelStyle.Render(m.labels[0]+" "),
+		m.inputs[0].View(),
+	)
 
-		var cursor, box string
-		switch {
-		case isCursor:
-			cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
-		default:
-			cursor = "  "
-		}
-		if on {
-			box = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("[x]")
-		} else {
-			box = lipgloss.NewStyle().Foreground(dimColor).Render("[ ]")
-		}
+	parts := []string{inputRow}
 
-		labelStyle := lipgloss.NewStyle().Foreground(labelCol)
-		if isCursor {
-			labelStyle = labelStyle.Foreground(valueCol).Bold(true)
+	// Render the suggestions block.
+	if len(m.fileSuggestions) > 0 {
+		hint := lipgloss.NewStyle().Foreground(dimColor).Italic(true).
+			Render(fmt.Sprintf("  Found %d archive(s) in current directory (newest first):",
+				len(m.fileSuggestions)))
+		parts = append(parts, "", hint)
+		for i, name := range m.fileSuggestions {
+			cursor := "  "
+			nameStyled := lipgloss.NewStyle().Foreground(labelCol).Render(name)
+			if i == m.fileSuggestionIdx {
+				cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
+				nameStyled = lipgloss.NewStyle().Foreground(valueCol).Bold(true).Render(name)
+			}
+			parts = append(parts, "  "+cursor+nameStyled)
 		}
-		descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
-
-		row := cursor + box + " " + labelStyle.Render(opt.label) + "  " + descStyle.Render(opt.desc)
-		rows = append(rows, row)
+	} else {
+		hint := lipgloss.NewStyle().Foreground(dimColor).Italic(true).
+			Render("  (no .tar.zst or .zip archives found in current directory)")
+		parts = append(parts, "", hint)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(72).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(72).Render(
+		lipgloss.JoinVertical(lipgloss.Left, parts...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 func (m wizardModel) viewInputStep() string {
@@ -799,17 +825,9 @@ func (m wizardModel) viewInputStep() string {
 		))
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, fields...)
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(64).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(64).Render(
+		lipgloss.JoinVertical(lipgloss.Left, fields...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 // renderListRow renders one selectable list row: cursor arrow, label,
@@ -882,17 +900,57 @@ func runWizard() error {
 		}
 
 	case "import":
+		// Profiles flagged unsafe (typically prod) require an extra
+		// typed-host confirmation. Importing can rewrite schema and
+		// data; muscle-memory `enter` on the wrong target was the
+		// motivating accident.
+		if res.targetProf.Unsafe {
+			if !confirmUnsafeFromTTY("import", res.targetProf.URL) {
+				fmt.Println("Aborted.")
+				return nil
+			}
+		}
+		// Hand off to the import picker for items + safety params.
+		// This is the same TUI the user sees with `diet import --pick`,
+		// reused here so the wizard flow gets the same conservative
+		// defaults (no-folders ON, etc.) without needing a separate
+		// implementation.
+		picked, err := runImportPicker(res.inputFile)
+		if err != nil {
+			return err
+		}
+		if picked == nil {
+			fmt.Println("Cancelled.")
+			return nil
+		}
 		client := newClientWithOptions(res.targetProf.URL, res.targetProf.Token, res.targetProf.clientOptions())
 		if err := executeImport(client, res.inputFile, importOpts{
-			Data:                true,
-			UseTUI:              true,
-			BulkSchema:          true,
-			StripAccountability: res.stripAccountability,
+			Data: !picked.options.SkipData,
+			// Wizard owns the progress TUI itself, so pass UseTUI so
+			// the importer renders its progress bar / live log.
+			UseTUI:     true,
+			BulkSchema: true,
+			// Strip-accountability is now exclusively driven by the
+			// picker's params page; the wizard's legacy options
+			// screen was removed when the picker took over the role.
+			StripAccountability: picked.options.StripAccountability,
+			Collections:         picked.collections,
+			SystemEntities:      picked.systemEntities,
+			NoFolders:           picked.options.NoFolders,
 		}); err != nil {
 			return err
 		}
 
 	case "clean":
+		// Same gate as import — clean deletes collections / system
+		// items, so an unsafe profile must demand an explicit retype
+		// before we even open the picker.
+		if res.prof.Unsafe {
+			if !confirmUnsafeFromTTY("clean", res.prof.URL) {
+				fmt.Println("Aborted.")
+				return nil
+			}
+		}
 		client := newClientWithOptions(res.prof.URL, res.prof.Token, res.prof.clientOptions())
 		picker := newPicker(client, res.prof.URL, res.profileName, "", "", modeClean)
 		cp := tea.NewProgram(picker, tea.WithAltScreen())

@@ -28,6 +28,7 @@ func newImportCmd() *cobra.Command {
 	cmd.Flags().StringSlice("collections", nil, "Comma-separated user collections to import from the archive (default: all). Relations crossing the boundary are dropped with a warning.")
 	cmd.Flags().StringSlice("system-entities", nil, "Comma-separated system entity types to import (flows, dashboards, roles, users, translations, webhooks, operations, panels, presets). Default: all entity types present in the archive.")
 	cmd.Flags().Bool("pick", false, "Open an interactive picker to choose collections and system entities from the archive before importing. Mutually exclusive with --collections / --system-entities / --plain.")
+	cmd.Flags().Bool("no-folders", false, "Drop folder (schema-less) collections from the archive before import. Useful for ultra-conservative partial imports where you want zero UI-hierarchy changes on the target. Kept collections that pointed at a dropped folder via meta.group will appear ungrouped in the admin sidebar.")
 	_ = cmd.MarkFlagRequired("input")
 	_ = cmd.MarkFlagRequired("target-url")
 	_ = cmd.MarkFlagRequired("target-token")
@@ -48,6 +49,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	collectionsFilter, _ := cmd.Flags().GetStringSlice("collections")
 	systemEntitiesFilter, _ := cmd.Flags().GetStringSlice("system-entities")
 	pick, _ := cmd.Flags().GetBool("pick")
+	noFolders, _ := cmd.Flags().GetBool("no-folders")
 	plain, _ := cmd.Flags().GetBool("plain")
 
 	if pick && (len(collectionsFilter) > 0 || len(systemEntitiesFilter) > 0 || plain) {
@@ -69,6 +71,16 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 		collectionsFilter = picked.collections
 		systemEntitiesFilter = picked.systemEntities
+		// Safety toggles from the params page override the CLI defaults
+		// only when the picker says so — i.e. if the user explicitly
+		// passed --no-folders / --strip-accountability on the command
+		// line as well, the picker's value wins (TUI is the most
+		// recent source of truth in an interactive run).
+		noFolders = picked.options.NoFolders
+		stripAcc = picked.options.StripAccountability
+		if picked.options.SkipData {
+			importData = false
+		}
 	}
 
 	return executeImport(client, input, importOpts{
@@ -80,6 +92,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		Strict:              strict,
 		Collections:         collectionsFilter,
 		SystemEntities:      systemEntitiesFilter,
+		NoFolders:           noFolders,
 	})
 }
 
@@ -109,6 +122,12 @@ type importOpts struct {
 	// named system entity types ("flows", "dashboards", ...). Empty =
 	// no filter.
 	SystemEntities []string
+	// NoFolders, when true, drops every folder collection (schema=null)
+	// from the archive before applying. Use for paranoid prod imports
+	// where the goal is "do not touch admin-UI hierarchy on the target".
+	// Kept collections that pointed at a dropped folder via meta.group
+	// surface ungrouped in the admin sidebar.
+	NoFolders bool
 }
 
 func executeImport(client *apiClient, inputFile string, opts importOpts) error {
@@ -134,6 +153,13 @@ func executeImport(client *apiClient, inputFile string, opts importOpts) error {
 	if len(opts.SystemEntities) > 0 {
 		manifest, systemData = filterSystemSubset(manifest, systemData, opts.SystemEntities)
 		fmt.Printf("  Filter: %d system entity types kept\n", len(systemData))
+	}
+	if opts.NoFolders {
+		var dropped int
+		schema.Collections, dropped = stripFolderCollections(schema.Collections)
+		if dropped > 0 {
+			fmt.Printf("  Filter: dropped %d folder collections (--no-folders)\n", dropped)
+		}
 	}
 
 	fmt.Printf("  Source: %s (Directus %s)\n", manifest.SourceURL, manifest.DirectusVersion)

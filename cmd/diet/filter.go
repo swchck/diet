@@ -174,6 +174,40 @@ func filterArchiveSubset(
 	return manifest, schema, newData, report
 }
 
+// stripFolderCollections drops every folder collection (schema=null) from
+// schema.Collections. Folders are UI-hierarchy nodes with no DB table and
+// no fields/relations of their own, so trimming them only changes admin
+// display — never data.
+//
+// Why we expose this as a separate option (--no-folders) rather than doing
+// it automatically: folders carry meta.group references, and dropping them
+// leaves any kept collection that points there orphan-grouped (Directus
+// shows them under "Other" in the sidebar). For a normal full import that's
+// regressive UI; for a paranoid partial production import it's exactly what
+// you want — zero hierarchy delta on the target.
+//
+// Returns the trimmed slice and the count of folders removed. Pass-through
+// (no copy) when there are no folders.
+func stripFolderCollections(cols []CollectionInfo) ([]CollectionInfo, int) {
+	dropped := 0
+	for _, c := range cols {
+		if isNullOrEmpty(c.Schema) {
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		return cols, 0
+	}
+	out := make([]CollectionInfo, 0, len(cols)-dropped)
+	for _, c := range cols {
+		if isNullOrEmpty(c.Schema) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, dropped
+}
+
 // filterSystemSubset trims systemData and manifest.SystemEntities to the
 // chosen entity types (flows / dashboards / roles / ...). Pass nil/empty
 // `keep` to skip filtering. `keep` should be a slice of entity-type
