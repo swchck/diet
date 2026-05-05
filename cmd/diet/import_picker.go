@@ -257,38 +257,51 @@ func (m *importPickerModel) rebuildTable() {
 	if w <= 0 {
 		w = 80
 	}
-	nameW := max(w-22, 30)
+	// Reserve a slim col for the selection dot, give the items count
+	// some room, and let the name take the rest. Same spacing as the
+	// export picker.
+	nameW := max(w-28, 30)
 
 	kind := m.activeKind()
 	var cols []table.Column
 	if kind == itemKindCollection {
 		cols = []table.Column{
-			{Title: "", Width: 3},
 			{Title: "Collection", Width: nameW},
 			{Title: "Items", Width: 10},
 		}
 	} else {
 		cols = []table.Column{
-			{Title: "", Width: 3},
 			{Title: "Entity type", Width: nameW},
-			{Title: "", Width: 10},
+			{Title: "Count", Width: 10},
 		}
 	}
+
+	// Selection markers — same glyphs and colors the export picker uses
+	// (see picker.buildRows). Green ● for selected, dim ○ for not.
+	selectedMark := lipgloss.NewStyle().Foreground(okColor).Bold(true).Render("●")
+	emptyMark := lipgloss.NewStyle().Foreground(dimColor).Render("○")
 
 	rows := make([]table.Row, 0, len(m.items))
 	for _, it := range m.items {
 		if it.kind != kind {
 			continue
 		}
-		check := "[ ]"
+		mark := emptyMark
 		if it.selected {
-			check = "[x]"
+			mark = selectedMark
 		}
-		count := ""
+		nameStyled := it.name
+		if !it.selected {
+			nameStyled = lipgloss.NewStyle().Foreground(dimColor).Render(it.name)
+		}
+		var count string
 		if it.kind == itemKindCollection {
-			count = fmt.Sprintf("%d", it.itemCount)
+			count = colorizeCount(it.itemCount)
 		}
-		rows = append(rows, table.Row{check, it.name, count})
+		rows = append(rows, table.Row{
+			mark + " " + nameStyled,
+			count,
+		})
 	}
 
 	s := table.DefaultStyles()
@@ -484,7 +497,7 @@ func (m importPickerModel) View() string {
 // metadata block, tabs, table, key bar. Same widths, same colours — the
 // goal is "indistinguishable from export at a glance".
 func (m importPickerModel) viewItems(w, h int) string {
-	title := titleBar.Render("◆ Diet › Import › Step 1 of 2 — pick what to import")
+	title := titleBar.Render(m.titleText())
 	meta := m.viewHeaderMeta(w)
 	metaLines := strings.Count(meta, "\n") + 1
 
@@ -494,7 +507,6 @@ func (m importPickerModel) viewItems(w, h int) string {
 	}
 
 	keyBar := renderKeyBar(w-2,
-		[2]string{"↑↓", "move"},
 		[2]string{"space", "select"},
 		[2]string{"a", "all"},
 		[2]string{"tab", "next tab"},
@@ -574,6 +586,27 @@ func (m importPickerModel) viewHeaderMeta(w int) string {
 	leftCol := lipgloss.NewStyle().Width(w / 2).Padding(0, 1).Render(left)
 	rightCol := lipgloss.NewStyle().Padding(0, 1).Render(right)
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+}
+
+// titleText is the breadcrumb-style title shown at the top of the items
+// page, mirroring the export picker's "◆ Diet › Export › Collections (97)".
+// The active tab segment with its row count is the rightmost element so
+// the user always sees how many things are in the bucket they're looking
+// at.
+func (m importPickerModel) titleText() string {
+	sep := lipgloss.NewStyle().Foreground(dimColor).Render(" › ")
+	parts := []string{"◆ Diet", "Import"}
+	if m.activeTab >= 0 && m.activeTab < len(m.tabs) {
+		t := m.tabs[m.activeTab]
+		count := 0
+		for _, it := range m.items {
+			if it.kind == t.kind {
+				count++
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%s (%d)", t.label, count))
+	}
+	return strings.Join(parts, sep)
 }
 
 func (m importPickerModel) renderTabs(maxW int) string {

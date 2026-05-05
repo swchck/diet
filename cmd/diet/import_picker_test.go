@@ -199,7 +199,9 @@ func TestImportPicker_View_RendersHeaderAndTable(t *testing.T) {
 	m := fixtureModel([]string{"posts"}, []string{"flows"})
 	v := m.View()
 	for _, want := range []string{
-		"Step 1 of 2",
+		"Diet",
+		"Import",
+		"Collections",
 		"Archive",
 		"posts",
 		"next tab",
