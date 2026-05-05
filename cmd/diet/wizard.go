@@ -608,21 +608,7 @@ func (m wizardModel) result() wizardResult {
 }
 
 // View
-
-// wizardBanner is the centered title block shown at the top of every step.
-func (m wizardModel) wizardBanner() string {
-	logo := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(borderColor).
-		Render("◆  D I E T")
-	tag := lipgloss.NewStyle().
-		Foreground(dimColor).
-		Render("Directus Import Export Tool")
-	ver := lipgloss.NewStyle().
-		Foreground(dimColor).
-		Render("v" + version)
-	return lipgloss.JoinVertical(lipgloss.Center, logo, tag, ver)
-}
+// (banner moved to ui.go as uiBanner — shared with import picker.)
 
 // wizardHints renders a row of colored key chips for the current step.
 func (m wizardModel) wizardHints() string {
@@ -648,28 +634,19 @@ func (m wizardModel) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
-
-	var body string
 	switch m.step {
 	case stepOperation:
-		body = m.viewOperationStep()
+		return m.viewOperationStep()
 	case stepProfile:
-		body = m.viewProfileStep("Select source server", m.cfg.Profiles)
+		return m.viewProfileStep("Select source server", m.cfg.Profiles)
 	case stepImportTarget:
-		body = m.viewProfileStep("Select target server", m.cfg.Profiles)
+		return m.viewProfileStep("Select target server", m.cfg.Profiles)
 	case stepNewProfile, stepNewTarget:
-		body = m.viewInputStep()
+		return m.viewInputStep()
 	case stepImportFile:
-		body = m.viewFileStep()
+		return m.viewFileStep()
 	}
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(1, 4).
-		Render(body)
-
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return ""
 }
 
 // stepLabel describes the current step in the breadcrumb-style sub-heading.
@@ -760,16 +737,7 @@ func (m wizardModel) viewOperationStep() string {
 
 	body := lipgloss.NewStyle().Width(tableW).Render(
 		lipgloss.JoinVertical(lipgloss.Left, rows...))
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		body,
-		"",
-		m.wizardHints(),
-	)
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) string {
@@ -785,17 +753,9 @@ func (m wizardModel) viewProfileStep(_ string, profiles map[string]profile) stri
 		rows[i] = renderListRow(name, desc, i == m.profileIdx, isNew)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(56).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(56).Render(
+		lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 // viewFileStep is a specialised input step that combines the textinput
@@ -842,16 +802,9 @@ func (m wizardModel) viewFileStep() string {
 		parts = append(parts, "", hint)
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, parts...)
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(72).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(72).Render(
+		lipgloss.JoinVertical(lipgloss.Left, parts...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 func (m wizardModel) viewInputStep() string {
@@ -872,17 +825,9 @@ func (m wizardModel) viewInputStep() string {
 		))
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, fields...)
-
-	return lipgloss.JoinVertical(lipgloss.Center,
-		m.wizardBanner(),
-		"",
-		heading,
-		"",
-		lipgloss.NewStyle().Width(64).Render(body),
-		"",
-		m.wizardHints(),
-	)
+	body := lipgloss.NewStyle().Width(64).Render(
+		lipgloss.JoinVertical(lipgloss.Left, fields...))
+	return uiFramedScreen(m.width, m.height, heading, body, m.wizardHints())
 }
 
 // renderListRow renders one selectable list row: cursor arrow, label,
