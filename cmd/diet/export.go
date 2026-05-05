@@ -19,6 +19,7 @@ func newExportCmd() *cobra.Command {
 	cmd.Flags().StringP("output", "o", "", "Output archive path (default: auto-generated)")
 	cmd.Flags().String("format", "zstd", "Archive format: zstd or zip")
 	cmd.Flags().Bool("all", false, "Export all collections without interactive picker")
+	cmd.Flags().Bool("system", false, "Also export system entities (flows, dashboards, roles, users, etc.). TUI exports them via the picker; this flag enables them in --plain/--all mode where there is no picker.")
 	return cmd
 }
 
@@ -29,6 +30,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	format, _ := cmd.Flags().GetString("format")
 	plain, _ := cmd.Flags().GetBool("plain")
 	all, _ := cmd.Flags().GetBool("all")
+	includeSystem, _ := cmd.Flags().GetBool("system")
 
 	if url == "" || token == "" {
 		return fmt.Errorf("--url and --token are required")
@@ -37,7 +39,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	client := newClientWithOptions(url, token, clientOptionsFromFlags(cmd))
 
 	if plain || all {
-		return runSimpleExport(client, url, output, format, all)
+		return runSimpleExport(client, url, output, format, all, includeSystem)
 	}
 
 	// Full TUI mode — picker opens immediately, loads async.
@@ -60,7 +62,13 @@ func runExport(cmd *cobra.Command, args []string) error {
 }
 
 // runSimpleExport handles --plain and --all modes (no TUI).
-func runSimpleExport(client *apiClient, sourceURL, output, format string, all bool) error {
+//
+// includeSystem mirrors the TUI's system-entity picker — when true, every
+// flow/dashboard/role/user/translation/webhook is captured along with its
+// dependents (operations, panels, presets). When false (the historical
+// default), the archive contains only user collections + their data, which
+// matches what `diet export --all` has always done.
+func runSimpleExport(client *apiClient, sourceURL, output, format string, all, includeSystem bool) error {
 	fmt.Println("Connecting to", sourceURL)
 	collections, err := fetchCollections(client)
 	if err != nil {
@@ -129,6 +137,19 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 		fmt.Println(msg)
 	})
 
+	var systemData map[string][]json.RawMessage
+	var sysNames []string
+	if includeSystem {
+		fmt.Println("Pulling system entities...")
+		systemData = fetchAllSystemEntities(client, selectedSet, func(msg string) {
+			fmt.Println("  " + msg)
+		})
+		for name, items := range systemData {
+			sysNames = append(sysNames, name)
+			fmt.Printf("  %s: %d\n", name, len(items))
+		}
+	}
+
 	directusVersion := ""
 	var si struct {
 		Data struct{ Version string `json:"version"` } `json:"data"`
@@ -153,6 +174,7 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 		Format:          format,
 		Collections:     selected,
 		ItemCounts:      itemCounts,
+		SystemEntities:  sysNames,
 	}
 
 	schema := SchemaBundle{
@@ -170,7 +192,7 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 	}
 
 	fmt.Printf("Packing archive (%s)...\n", format)
-	if err := createArchive(format, output, manifest, schema, dataMap, nil); err != nil {
+	if err := createArchive(format, output, manifest, schema, dataMap, systemData); err != nil {
 		return fmt.Errorf("create archive: %w", err)
 	}
 
@@ -178,6 +200,13 @@ func runSimpleExport(client *apiClient, sourceURL, output, format string, all bo
 	fmt.Printf("  Archive: %s (%s)\n", output, archiveSize(output))
 	fmt.Printf("  Collections: %d, Fields: %d, Relations: %d, Items: %d\n",
 		len(selected), len(allFields), len(exportRelations), totalItems)
+	if len(systemData) > 0 {
+		totalSys := 0
+		for _, items := range systemData {
+			totalSys += len(items)
+		}
+		fmt.Printf("  System: %d types, %d items\n", len(systemData), totalSys)
+	}
 
 	return nil
 }

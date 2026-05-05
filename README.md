@@ -50,6 +50,10 @@ diet export --url=https://directus.example.com --token=YOUR_TOKEN
 # Export all collections without TUI
 diet export --url=https://directus.example.com --token=YOUR_TOKEN --all
 
+# Export collections AND every system entity (flows, dashboards, roles,
+# users, translations, webhooks + their dependents). Mirrors the TUI default.
+diet export --url=... --token=... --all --system
+
 # Custom output path and format
 diet export --url=... --token=... -o backup.zip --format=zip
 ```

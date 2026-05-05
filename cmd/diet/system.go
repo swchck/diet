@@ -86,6 +86,72 @@ func countSystemItems(client *apiClient, endpoint string) int {
 	return parseAggregateCount(body)
 }
 
+// fetchAllSystemEntities pulls every system entity into the same map shape
+// the TUI builds (`name -> []rawItem`). Independent types are taken whole;
+// dependent ones are filtered to keep the archive consistent:
+//
+//   - operations are kept for every fetched flow (we include all flows here,
+//     so we include all operations);
+//   - panels are kept for every fetched dashboard;
+//   - presets are kept only for the user collections we're exporting —
+//     other presets reference collections this archive doesn't carry.
+//
+// userColSet is the same selection set used to filter relations & data;
+// pass nil to skip the presets-by-collection filter (i.e. include all
+// presets regardless of which collection they target).
+func fetchAllSystemEntities(client *apiClient, userColSet map[string]bool, log func(string)) map[string][]json.RawMessage {
+	result := make(map[string][]json.RawMessage)
+	for _, et := range systemEntityTypes {
+		items, err := fetchSystemItems(client, et.Endpoint)
+		if err != nil {
+			if log != nil {
+				log(fmt.Sprintf("WARN: fetch %s: %v", et.Name, err))
+			}
+			continue
+		}
+		// Strip sensitive fields where applicable (mirror TUI behavior).
+		for i := range items {
+			items[i] = stripSensitiveFields(et.Name, items[i])
+		}
+		if len(items) > 0 {
+			result[et.Name] = items
+		}
+	}
+
+	// Dependent entities. We include all of them since we included all
+	// flows / dashboards above; presets get the userColSet filter.
+	if ops, err := fetchSystemItems(client, "/operations"); err == nil && len(ops) > 0 {
+		result["operations"] = ops
+	}
+	if panels, err := fetchSystemItems(client, "/panels"); err == nil && len(panels) > 0 {
+		result["panels"] = panels
+	}
+	if presets, err := fetchSystemItems(client, "/presets"); err == nil && len(presets) > 0 {
+		if userColSet == nil {
+			result["presets"] = presets
+		} else {
+			var kept []json.RawMessage
+			for _, p := range presets {
+				var obj struct {
+					Collection string `json:"collection"`
+				}
+				if json.Unmarshal(p, &obj) != nil {
+					continue
+				}
+				// Empty collection = global preset, keep it.
+				if obj.Collection == "" || userColSet[obj.Collection] {
+					kept = append(kept, p)
+				}
+			}
+			if len(kept) > 0 {
+				result["presets"] = kept
+			}
+		}
+	}
+
+	return result
+}
+
 // Insert (import)
 
 func insertSystemItems(client *apiClient, endpoint string, items []json.RawMessage) (int, int) {
