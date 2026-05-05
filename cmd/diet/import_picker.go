@@ -290,16 +290,18 @@ func (m *importPickerModel) rebuildTable() {
 		if it.selected {
 			mark = selectedMark
 		}
-		nameStyled := it.name
-		if !it.selected {
-			nameStyled = lipgloss.NewStyle().Foreground(dimColor).Render(it.name)
-		}
+		// Name stays plain — the dot already encodes selected/not.
+		// Pre-styling the name with dimColor produces an unfortunate
+		// clash on the cursor row: the table's Selected style paints
+		// the cell background purple but the embedded ANSI dim
+		// foreground sticks, leaving "purple bg + grey text" instead
+		// of the expected highlighted-row look.
 		var count string
 		if it.kind == itemKindCollection {
 			count = colorizeCount(it.itemCount)
 		}
 		rows = append(rows, table.Row{
-			mark + " " + nameStyled,
+			mark + " " + it.name,
 			count,
 		})
 	}
@@ -630,27 +632,43 @@ func (m importPickerModel) renderTabs(maxW int) string {
 }
 
 // viewParams renders the safety-toggles page wrapped in the wizard's
-// rounded-border frame, centered on screen. Same visual language as
-// stepProfile / stepNewProfile so the user doesn't experience a jarring
-// style change between picker pages and wizard.
+// rounded-border frame, centered on screen. Layout mirrors
+// viewOperationStep: cursor arrow + indicator + bold label, with the
+// description on the next line, indented and width-clamped so long
+// blurbs wrap cleanly inside the column instead of bleeding to the
+// box's left edge. Indicator glyphs (●/○) match the items page so the
+// "what's selected" cue is consistent across both pages.
 func (m importPickerModel) viewParams(w, h int) string {
 	heading := lipgloss.NewStyle().Foreground(dimColor).
 		Render("Import · Step 2 of 2 — safety options (defaults are conservative)")
+
+	const (
+		cursorW = 2 // "▸ " or "  "
+		dotW    = 2 // "●" or "○" + trailing space
+		descW   = 60
+		bodyW   = cursorW + dotW + descW
+		descPad = cursorW + dotW // align desc under the label text
+	)
+
+	descStyle := lipgloss.NewStyle().
+		Foreground(dimColor).
+		Italic(true).
+		Width(descW)
 
 	rows := make([]string, 0, len(m.params)*2)
 	for i, p := range m.params {
 		isCursor := i == m.paramCursor
 
-		var cursor, box string
+		var cursor, dot string
 		if isCursor {
 			cursor = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("▸ ")
 		} else {
 			cursor = "  "
 		}
 		if p.on {
-			box = lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render("[x]")
+			dot = lipgloss.NewStyle().Foreground(okColor).Bold(true).Render("● ")
 		} else {
-			box = lipgloss.NewStyle().Foreground(dimColor).Render("[ ]")
+			dot = lipgloss.NewStyle().Foreground(dimColor).Render("○ ")
 		}
 
 		labelStyle := lipgloss.NewStyle().Foreground(labelCol)
@@ -661,16 +679,25 @@ func (m importPickerModel) viewParams(w, h int) string {
 		if p.on != p.defaultOn {
 			marker = lipgloss.NewStyle().Foreground(warnColor).Bold(true).Render(" *")
 		}
-		descStyle := lipgloss.NewStyle().Foreground(dimColor).Italic(true)
 
 		rows = append(rows,
-			cursor+box+" "+labelStyle.Render(p.label)+marker,
-			"      "+descStyle.Render(p.desc),
+			cursor+dot+labelStyle.Render(p.label)+marker,
 		)
+		// Wrap description into descW; indent each wrapped line so it
+		// hangs under the label (not under the cursor / dot).
+		wrapped := descStyle.Render(p.desc)
+		for _, line := range strings.Split(wrapped, "\n") {
+			rows = append(rows, strings.Repeat(" ", descPad)+line)
+		}
+		if i < len(m.params)-1 {
+			rows = append(rows, "") // breathing room between toggles
+		}
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
-	hints := renderKeyBar(72,
+	body := lipgloss.NewStyle().Width(bodyW).Render(
+		lipgloss.JoinVertical(lipgloss.Left, rows...))
+
+	hints := renderKeyBar(bodyW,
 		[2]string{"↑↓", "move"},
 		[2]string{"space", "toggle"},
 		[2]string{"enter", "import"},
@@ -689,7 +716,7 @@ func (m importPickerModel) viewParams(w, h int) string {
 		"",
 		heading,
 		"",
-		lipgloss.NewStyle().Width(72).Render(body),
+		body,
 		"",
 		legend,
 		"",
