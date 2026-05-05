@@ -119,12 +119,14 @@ func applyDataDirect(
 			if len(cd.items) == 0 {
 				continue
 			}
-			ins, failed, err := copyOrInsert(ctx, pool, cd.name, cd.dbCols, cd.dbFields, cd.items)
+			ins, failed, outcome, err := copyOrInsert(ctx, pool, cd.name, cd.dbCols, cd.dbFields, cd.items)
 			if err != nil {
 				log(fmt.Sprintf("WARN: %s: %v", cd.name, err))
 			}
 			progress.inserted.Add(int64(ins))
 			passInserted.Add(int64(ins))
+			cd.notNullFKDrops += outcome.notNullFKDrops
+			cd.otherDrops += outcome.otherDrops
 			cd.items = failed
 		}
 
@@ -140,7 +142,22 @@ func applyDataDirect(
 	}
 
 	for _, cd := range allData {
-		progress.failed.Add(int64(len(cd.items)))
+		// retryable items left after the last pass + the structurally-dropped
+		// rows from earlier passes both count as "failed".
+		progress.failed.Add(int64(len(cd.items) + cd.notNullFKDrops + cd.otherDrops))
+
+		// Per-collection diagnostic so the user knows WHY rows were dropped.
+		// NOT NULL FK drops are the direct-DB equivalent of "REST would have
+		// auto-filled this for us"; surface them so the user can decide
+		// whether to fall back to REST for that collection.
+		if cd.notNullFKDrops > 0 {
+			log(fmt.Sprintf("WARN: %s: %d rows dropped (NOT NULL FK to missing reference; REST path auto-fills these — re-run without --db-dsn for this collection if you need them)",
+				cd.name, cd.notNullFKDrops))
+		}
+		if cd.otherDrops > 0 {
+			log(fmt.Sprintf("WARN: %s: %d rows dropped (UNIQUE/CHECK/cast violation, retry won't help)",
+				cd.name, cd.otherDrops))
+		}
 	}
 
 	fixSequences(ctx, pool, allData, log)
@@ -150,13 +167,17 @@ func applyDataDirect(
 
 // directColData is the per-collection plan we build once before the
 // retry loop. Items shrinks across passes; everything else is invariant.
+// notNullFKDrops/otherDrops accumulate across passes so we can report a
+// per-collection diagnostic at the end.
 type directColData struct {
-	name      string
-	items     []json.RawMessage
-	dbCols    []string
-	dbFields  []FieldInfo
-	hasSerial bool   // true if PK is auto-increment, so we know to fix the sequence
-	pkField   string // PK column name (only set when hasSerial)
+	name           string
+	items          []json.RawMessage
+	dbCols         []string
+	dbFields       []FieldInfo
+	hasSerial      bool   // true if PK is auto-increment, so we know to fix the sequence
+	pkField        string // PK column name (only set when hasSerial)
+	notNullFKDrops int    // rows lost because NULL'd FK column was NOT NULL in target
+	otherDrops     int    // rows lost on UNIQUE/CHECK/cast errors
 }
 
 func prepareDirectData(
@@ -254,21 +275,21 @@ func copyOrInsert(
 	cols []string,
 	fields []FieldInfo,
 	items []json.RawMessage,
-) (int, []json.RawMessage, error) {
+) (int, []json.RawMessage, rowOutcome, error) {
 	rows, err := buildCopyRows(items, cols, fields)
 	if err != nil {
-		return 0, items, fmt.Errorf("encode rows: %w", err)
+		return 0, items, rowOutcome{}, fmt.Errorf("encode rows: %w", err)
 	}
 
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return 0, items, fmt.Errorf("acquire conn: %w", err)
+		return 0, items, rowOutcome{}, fmt.Errorf("acquire conn: %w", err)
 	}
 	defer conn.Release()
 
 	n, copyErr := conn.CopyFrom(ctx, pgx.Identifier{collection}, cols, pgx.CopyFromRows(rows))
 	if copyErr == nil {
-		return int(n), nil, nil
+		return int(n), nil, rowOutcome{}, nil
 	}
 
 	// COPY failed atomically — the connection is now in an aborted state,
@@ -276,12 +297,33 @@ func copyOrInsert(
 	conn.Release()
 	freshConn, err := pool.Acquire(ctx)
 	if err != nil {
-		return 0, items, fmt.Errorf("acquire fallback conn: %w (original COPY error: %v)", err, copyErr)
+		return 0, items, rowOutcome{}, fmt.Errorf("acquire fallback conn: %w (original COPY error: %v)", err, copyErr)
 	}
 	defer freshConn.Release()
 
-	ins, retry := insertPerRow(ctx, freshConn.Conn(), collection, cols, fields, items)
-	return ins, retry, copyErr
+	ins, retry, outcome := insertPerRow(ctx, freshConn.Conn(), collection, cols, fields, items)
+	return ins, retry, outcome, copyErr
+}
+
+// rowOutcome categorises why a row didn't make it during a per-row pass.
+// Surfacing the categories — instead of bucketing everything as "failed"
+// — lets the user see which losses are real (NOT NULL FK to a missing
+// row, where the REST path would have substituted the importer's user
+// ID) vs which are just transient FK ordering issues that the next pass
+// will resolve.
+type rowOutcome struct {
+	// notNullFKDrops counts rows that hit a NOT NULL constraint after we
+	// nulled out an FK column during recovery. These will NEVER succeed
+	// on retry — the column is structurally non-nullable in the target
+	// schema, and we have no real value to put there. The REST path
+	// avoids this case entirely because Directus auto-fills user FKs
+	// (created_by, updated_by, etc.) with the importing token's user ID.
+	notNullFKDrops int
+	// otherDrops counts rows that hit a non-FK, non-NOT-NULL error
+	// (UNIQUE, CHECK, type cast). Same as notNullFKDrops, retrying won't
+	// help — surface separately so the user can decide if it's a schema
+	// gap or a data shape issue.
+	otherDrops int
 }
 
 // insertPerRow runs `INSERT INTO <table> (<cols>) VALUES (...)` once per
@@ -298,8 +340,14 @@ func copyOrInsert(
 // tolerates missing references by leaving them blank rather than
 // failing the whole row.
 //
-// Items that still fail (NOT NULL constraint, unique violation,
-// non-FK error) are returned for the next retry pass.
+// Three outcomes per row:
+//
+//   - landed (counted in `inserted`)
+//   - permanently dropped this pass (NOT NULL FK or non-FK error;
+//     reflected in the returned rowOutcome and NOT placed in retryable —
+//     retrying won't help)
+//   - transiently failed (unparseable error / item-encoding error;
+//     placed in retryable so the next pass picks it up)
 func insertPerRow(
 	ctx context.Context,
 	conn *pgx.Conn,
@@ -307,7 +355,7 @@ func insertPerRow(
 	cols []string,
 	fields []FieldInfo,
 	items []json.RawMessage,
-) (int, []json.RawMessage) {
+) (int, []json.RawMessage, rowOutcome) {
 	placeholders := make([]string, len(cols))
 	for i := range cols {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
@@ -325,6 +373,7 @@ func insertPerRow(
 
 	inserted := 0
 	var retryable []json.RawMessage
+	var outcome rowOutcome
 	for _, raw := range items {
 		row, err := encodeRow(raw, cols, fields)
 		if err != nil {
@@ -337,6 +386,8 @@ func insertPerRow(
 		// dangling FK) we end up with an all-NULL row; the final
 		// attempt either inserts it or hits NOT NULL and we move on.
 		landed := false
+		var lastErr error
+		nulledFK := false
 		for attempt := 0; attempt <= len(cols); attempt++ {
 			_, err := conn.Exec(ctx, stmt, row...)
 			if err == nil {
@@ -344,6 +395,7 @@ func insertPerRow(
 				landed = true
 				break
 			}
+			lastErr = err
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != pgErrCodeFKViolation {
 				break // non-FK error; nullifying won't help
@@ -357,19 +409,76 @@ func insertPerRow(
 				break // not in our cols, or already nulled — give up
 			}
 			row[i] = nil
+			nulledFK = true
 			// loop and retry with the column nulled
 		}
-		if !landed {
+		if landed {
+			continue
+		}
+		switch categorizeRowFailure(lastErr, nulledFK) {
+		case dropNotNullFK:
+			outcome.notNullFKDrops++
+		case dropOther:
+			outcome.otherDrops++
+		default:
 			retryable = append(retryable, raw)
 		}
 	}
-	return inserted, retryable
+	return inserted, retryable, outcome
+}
+
+// rowFailureCategory classifies why a single per-row INSERT didn't land,
+// so the caller can split "retry might help" from "structurally hopeless".
+type rowFailureCategory int
+
+const (
+	// dropRetryable: leave the row on the retry pile — the next pass may
+	// resolve whatever's blocking (cross-collection FK ordering, transient
+	// connection issue, unparseable error).
+	dropRetryable rowFailureCategory = iota
+	// dropNotNullFK: we nulled an FK column during recovery, then Postgres
+	// rejected the row with NOT NULL violation on that column. The column
+	// is structurally non-nullable in the target — retrying with the same
+	// row produces the same path. Surface separately because the REST
+	// path doesn't see this case (Directus auto-fills user FKs).
+	dropNotNullFK
+	// dropOther: non-FK pg error (UNIQUE, CHECK, type cast, etc).
+	// Retrying won't suddenly start working.
+	dropOther
+)
+
+// categorizeRowFailure inspects the final error from the per-row INSERT
+// loop (after FK-recovery has been exhausted) and decides which bucket
+// the row falls into.
+//
+// Pulled out from insertPerRow so the categorization can be unit tested
+// without a live Postgres connection — pgconn.PgError values can be
+// constructed directly in tests, *pgx.Conn cannot.
+func categorizeRowFailure(lastErr error, nulledFK bool) rowFailureCategory {
+	var pgErr *pgconn.PgError
+	if !errors.As(lastErr, &pgErr) {
+		return dropRetryable
+	}
+	switch {
+	case pgErr.Code == pgErrCodeNotNullViolation && nulledFK:
+		return dropNotNullFK
+	case pgErr.Code != pgErrCodeFKViolation:
+		return dropOther
+	default:
+		return dropRetryable
+	}
 }
 
 // pgErrCodeFKViolation is Postgres's SQLSTATE for foreign_key_violation.
 // We branch on it specifically so genuine errors (NOT NULL, unique,
 // check) don't trigger the null-and-retry loop.
 const pgErrCodeFKViolation = "23503"
+
+// pgErrCodeNotNullViolation is Postgres's SQLSTATE for not_null_violation.
+// We watch for this AFTER nulling an FK column — the combination signals
+// "this column is structurally non-nullable in the target and we have no
+// value for it", which is unrecoverable in this code path.
+const pgErrCodeNotNullViolation = "23502"
 
 // fkDetailRe captures the column name from a Postgres FK violation
 // detail message. The format is stable across Postgres versions:

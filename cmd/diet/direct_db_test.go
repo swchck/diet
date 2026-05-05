@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestCoerceValue_Integer(t *testing.T) {
@@ -446,5 +450,89 @@ func TestIndexFieldsByCollection(t *testing.T) {
 	}
 	if len(idx["nonexistent"]) != 0 {
 		t.Errorf("missing: should be empty")
+	}
+}
+
+// TestCategorizeRowFailure pins the truth table for which row-failure
+// outcomes go where after FK-recovery is exhausted. The function is the
+// single point that decides retryable vs structurally-dropped vs
+// not-null-FK-dropped, so each branch needs explicit coverage.
+func TestCategorizeRowFailure(t *testing.T) {
+	mkPg := func(code string) error {
+		return &pgconn.PgError{Code: code, Message: "test"}
+	}
+
+	tests := []struct {
+		name      string
+		err       error
+		nulledFK  bool
+		want      rowFailureCategory
+	}{
+		{
+			name:     "FK violation that wasn't recovered (parser failure, etc.)",
+			err:      mkPg(pgErrCodeFKViolation),
+			nulledFK: false,
+			want:     dropRetryable,
+		},
+		{
+			name:     "FK violation after partial nulling (more cols to try next pass)",
+			err:      mkPg(pgErrCodeFKViolation),
+			nulledFK: true,
+			want:     dropRetryable,
+		},
+		{
+			name:     "NOT NULL after we nulled an FK column",
+			err:      mkPg(pgErrCodeNotNullViolation),
+			nulledFK: true,
+			want:     dropNotNullFK,
+		},
+		{
+			name: "NOT NULL but we never nulled anything (genuine NOT NULL gap)",
+			// Without nulledFK=true this is just a normal not-null gap that
+			// was never going to land anyway; treat it as "other" (no point
+			// retrying it).
+			err:      mkPg(pgErrCodeNotNullViolation),
+			nulledFK: false,
+			want:     dropOther,
+		},
+		{
+			name:     "UNIQUE violation",
+			err:      mkPg("23505"),
+			nulledFK: false,
+			want:     dropOther,
+		},
+		{
+			name:     "CHECK violation",
+			err:      mkPg("23514"),
+			nulledFK: false,
+			want:     dropOther,
+		},
+		{
+			name:     "INVALID datetime cast (a real-world case from this branch)",
+			err:      mkPg("22007"),
+			nulledFK: false,
+			want:     dropOther,
+		},
+		{
+			name:     "non-pg error: unparseable from server, retry it",
+			err:      errors.New("connection reset by peer"),
+			nulledFK: false,
+			want:     dropRetryable,
+		},
+		{
+			name:     "wrapped pg error still classified",
+			err:      fmt.Errorf("exec failed: %w", mkPg(pgErrCodeNotNullViolation)),
+			nulledFK: true,
+			want:     dropNotNullFK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := categorizeRowFailure(tt.err, tt.nulledFK)
+			if got != tt.want {
+				t.Errorf("categorizeRowFailure() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

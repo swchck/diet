@@ -172,7 +172,9 @@ For local development, CI fixtures, and one-shot migrations where you have direc
 - Postgres-side constraints (FK, NOT NULL, CHECK, UNIQUE) are still enforced.
 - Topological collection order is preserved, same as the REST path.
 - Auto-increment sequences are bumped to `MAX(pk)` after the load so the next admin-panel insert doesn't collide with imported IDs.
-- **FK-failure recovery**: when a row fails to insert because a foreign-key reference doesn't resolve in the target (e.g. `created_by` pointing to a user that wasn't imported), diet parses the failing column out of the Postgres error, sets it to `NULL`, and retries the row — same row lands, just without the dangling reference. Loops until the row inserts or all FK columns are exhausted. This matches what the REST path effectively gets for free, and on real-world archives ends up importing more rows than the REST path (which sometimes gives up on whole batches).
+- **FK-failure recovery**: when a row fails to insert because a foreign-key reference doesn't resolve in the target (e.g. `created_by` pointing to a user that wasn't imported), diet parses the failing column out of the Postgres error, sets it to `NULL`, and retries the row — same row lands, just without the dangling reference. Loops until the row inserts or all FK columns are exhausted. On nullable FK columns this matches what the REST path effectively gets for free.
+
+**Edge case the direct-DB path can't recover (and REST can):** when an FK column is **NOT NULL** in the target schema (e.g. an audit table where `created_by NOT NULL` references `directus_users`, and the referenced user wasn't imported), the recovery loop sets the column to `NULL` and Postgres rejects the row with a NOT NULL violation. Direct-DB drops these rows and emits a `WARN: <collection>: N rows dropped (NOT NULL FK to missing reference; REST path auto-fills these...)` message; the REST path doesn't hit this because Directus auto-substitutes the importing token's user ID. If the affected rows matter, re-run that collection without `--db-dsn`.
 
 **What's bypassed:**
 - Directus permissions / ACL checks.
