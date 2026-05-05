@@ -54,6 +54,12 @@ diet export --url=https://directus.example.com --token=YOUR_TOKEN --all
 # users, translations, webhooks + their dependents). Mirrors the TUI default.
 diet export --url=... --token=... --all --system
 
+# Export ONLY the named collections (non-interactive, for CI / one-shot
+# migrations of a single new collection). --collections is mutually
+# exclusive with --all. Add --system to pull system entities too.
+diet export --url=... --token=... --collections=posts,tags
+diet export --url=... --token=... --collections=feature_flags --system
+
 # Custom output path and format
 diet export --url=... --token=... -o backup.zip --format=zip
 ```
@@ -70,6 +76,21 @@ diet import -i backup.tar.zst --target-url=... --target-token=... \
 
 # Skip data, import schema only
 diet import -i backup.tar.zst --target-url=... --target-token=... --data=false
+
+# Import ONLY the named collections from the archive (filter at import
+# time — same archive can be sliced different ways for different
+# targets). Relations crossing the boundary are dropped with a warning.
+diet import -i backup.tar.zst --target-url=... --target-token=... \
+  --collections=feature_flags
+
+# Filter system entity types similarly:
+diet import -i backup.tar.zst --target-url=... --target-token=... \
+  --system-entities=flows,dashboards
+
+# Open an interactive picker against the archive — pick which
+# collections and system entity types to apply. Mutually exclusive with
+# --collections / --system-entities / --plain.
+diet import -i backup.tar.zst --target-url=... --target-token=... --pick
 
 # Fastest path: skip audit log + crank concurrency
 diet --concurrency=24 --batch-size=200 import -i backup.tar.zst \
@@ -118,6 +139,9 @@ diet diff
 | `--db-dsn` | `""` | **UNSAFE — local/CI/manual pipelines only.** Postgres DSN. When set, items are loaded straight into Postgres via the `COPY` protocol, bypassing the Directus REST API. Schema still goes through Directus. Skips ACL, hooks, cache invalidation. ~4× faster than the REST path. On connection or COPY failure, falls back to REST automatically with a warning. |
 | `--data` | `true` | Also import item data. Set `--data=false` for schema-only. |
 | `--strict` | `false` | Exit non-zero on any partial failure (data items lost, system entities failed). Off by default — historical "log and continue" stance preserved for existing pipelines. CI jobs that need to detect silent breakage should turn it on. Even without `--strict`, a catastrophic outcome (0 of N data items inserted) is always reported as an error. |
+| `--collections` | `[]` | Comma-separated names. When set, only these user collections are imported from the archive. Cross-boundary relations and orphaned system custom fields are dropped with a warning. Typo / unknown name → hard error before any HTTP. |
+| `--system-entities` | `[]` | Comma-separated entity types (`flows`, `dashboards`, `roles`, `users`, `translations`, `webhooks`, `operations`, `panels`, `presets`). When set, only those types are applied from the archive. |
+| `--pick` | `false` | Open interactive picker against the archive's manifest before importing — choose collections and system entity types with checkboxes. Mutually exclusive with `--collections` / `--system-entities` / `--plain`. |
 
 The same tuning fields are persisted per-profile in `~/.config/diet/config.yml` via the wizard:
 

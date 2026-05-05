@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -133,6 +134,100 @@ func TestRunSimpleExport_WithSystem(t *testing.T) {
 	}
 	if !hasFlows {
 		t.Errorf("manifest.SystemEntities = %v, missing 'flows'", manifest.SystemEntities)
+	}
+}
+
+// fakeDirectusFiltered serves the same surface as fakeDirectus plus a
+// `tags` collection alongside `posts`. Used to verify --collections
+// filtering: only the collections explicitly named should be fetched.
+func fakeDirectusFiltered(t *testing.T, expectFetched map[string]bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/collections":
+			w.Write([]byte(`{"data":[
+				{"collection":"posts","schema":{"name":"posts"},"meta":{}},
+				{"collection":"tags","schema":{"name":"tags"},"meta":{}},
+				{"collection":"unrelated","schema":{"name":"unrelated"},"meta":{}}
+			]}`))
+		case strings.HasPrefix(r.URL.Path, "/fields/"):
+			col := strings.TrimPrefix(r.URL.Path, "/fields/")
+			if !expectFetched[col] {
+				t.Errorf("/fields/%s should not be fetched under filter", col)
+			}
+			w.Write([]byte(fmt.Sprintf(`{"data":[
+				{"collection":"%s","field":"id","type":"integer","schema":{"is_primary_key":true},"meta":{}}
+			]}`, col)))
+		case r.URL.Path == "/relations":
+			w.Write([]byte(`{"data":[]}`))
+		case r.URL.Path == "/server/info":
+			w.Write([]byte(`{"data":{"version":"11.17.0"}}`))
+		case strings.HasPrefix(r.URL.Path, "/items/"):
+			col := strings.TrimPrefix(r.URL.Path, "/items/")
+			// /items/<col>?aggregate or paginated
+			if strings.Contains(r.URL.RawQuery, "aggregate") {
+				w.Write([]byte(`{"data":[{"count":0}]}`))
+				return
+			}
+			if !expectFetched[col] {
+				t.Errorf("/items/%s should not be fetched under filter", col)
+			}
+			w.Write([]byte(`{"data":[]}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+}
+
+// TestRunFilteredExport_OnlyTouchesNamedCollections — `--collections=posts`
+// should hit /fields/posts and /items/posts but never /fields/tags or
+// /items/tags. The httptest handler trips the test if any unexpected
+// fetch lands.
+func TestRunFilteredExport_OnlyTouchesNamedCollections(t *testing.T) {
+	expect := map[string]bool{"posts": true}
+	srv := fakeDirectusFiltered(t, expect)
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "filtered.tar.zst")
+
+	c := newClient(srv.URL, "tok")
+	if err := runFilteredExport(c, srv.URL, out, "zstd", false, []string{"posts"}); err != nil {
+		t.Fatalf("runFilteredExport: %v", err)
+	}
+
+	manifest, _, _, _, err := extractArchive(out)
+	if err != nil {
+		t.Fatalf("extractArchive: %v", err)
+	}
+	if len(manifest.Collections) != 1 || manifest.Collections[0] != "posts" {
+		t.Errorf("manifest.Collections = %v, want [posts]", manifest.Collections)
+	}
+}
+
+// TestRunFilteredExport_ErrorsOnMissingName — typo / stale name. Must
+// fail loudly before producing an archive — silent empty exports are
+// the worst outcome.
+func TestRunFilteredExport_ErrorsOnMissingName(t *testing.T) {
+	srv := fakeDirectusFiltered(t, map[string]bool{}) // never expect any fetch
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "should-not-exist.tar.zst")
+
+	c := newClient(srv.URL, "tok")
+	err := runFilteredExport(c, srv.URL, out, "zstd", false, []string{"made_up_name"})
+	if err == nil {
+		t.Fatal("expected error for missing collection")
+	}
+	if !strings.Contains(err.Error(), "made_up_name") {
+		t.Errorf("err should mention the missing name: %v", err)
+	}
+	// Verify no archive was written.
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Errorf("archive was created despite error: %s", out)
 	}
 }
 
